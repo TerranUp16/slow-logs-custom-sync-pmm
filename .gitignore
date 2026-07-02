@@ -1,2 +1,6 @@
 .env
 certs/
+
+# Cowork/Claude Code local session state — machine-local, not part of the
+# deployable integration, and not something to ship in this repo.
+.claude/

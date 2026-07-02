@@ -51,6 +51,32 @@ SCRIPT_DIR="/var/log/mysql_sink/bin"
 INCOMING_DIR="/var/log/mysql_sink/incoming"
 PROCESSED_DIR="/var/log/mysql_sink/processed"
 
+echo "==> Checking OS compatibility"
+# Only Ubuntu 22.04 LTS and 24.04 LTS are supported. Percona has not released
+# (or tested) percona-release/pmm-client packages for other versions,
+# including 26.04 LTS — getting pmm-client installed there requires manually
+# rewriting apt package-source distro codenames to point at an older
+# release's repo. That may happen to work, but it's unverified by Percona
+# and can break silently on any Percona-side update. This is a warning, not
+# a hard stop, so existing unsupported test boxes aren't locked out — but
+# don't deploy a real integration this way.
+if [ -f /etc/os-release ]; then
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  case "${VERSION_ID:-}" in
+    22.04|24.04) : ;;
+    *)
+      echo "" >&2
+      echo "WARNING: this is Ubuntu ${VERSION_ID:-<unknown>}, not 22.04 LTS or 24.04 LTS." >&2
+      echo "Percona does not support/test pmm-client packages on this version. See the" >&2
+      echo "RUNBOOK 'Supported OS versions' note. Continuing in 5s — Ctrl+C to abort." >&2
+      sleep 5
+      ;;
+  esac
+else
+  echo "WARNING: /etc/os-release not found — could not verify this is a supported Ubuntu release." >&2
+fi
+
 echo "==> Preflight: verifying direct DB connectivity before making any changes"
 # Direct to DB_HOST:DB_PORT (not through socat — it doesn't exist yet) using
 # the local certs/do-ca.crt copy. Runs before any package installs, cert

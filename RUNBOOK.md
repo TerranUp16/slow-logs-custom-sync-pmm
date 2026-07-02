@@ -23,12 +23,24 @@ The daemon (`transform_logs.py`) runs as a persistent systemd service. It tails 
 
 | What | Notes |
 |------|-------|
-| **PMM Server Droplet** | Ubuntu 22.04+, minimum 4 GB RAM (8 GB recommended). Must be provisioned and reachable before running `setup.sh`. |
-| **Sink Droplet** | Ubuntu 22.04+, any size. This is where `setup.sh` runs. |
+| **PMM Server Droplet** | **Ubuntu 22.04 LTS or 24.04 LTS** — see "Supported OS versions" below. Minimum 4 GB RAM (8 GB recommended). Must be provisioned and reachable before running `setup.sh`. |
+| **Sink Droplet** | **Ubuntu 22.04 LTS or 24.04 LTS** — see "Supported OS versions" below. Any size. This is where `setup.sh` runs. |
 | **DNS hostname for the sink** | A public DNS **A record** pointing at the sink Droplet's IP (e.g. `logs.example.com → <SINK_IP>`). Required — the sink presents a Let's Encrypt cert for this name, and certbot's HTTP-01 challenge needs it to resolve here. No domain handy? `<IP-dashed>.sslip.io` works for testing. |
 | **DO Managed MySQL** | Slow query log must be enabled in the DO control panel (Database → Settings → Slow query log). |
 | **`pmm_monitor` DB user** | Create via DO control panel (Database → Users). DO grants admin-level access by default — no additional `GRANT` statements needed. |
 | **`.env` file** | Fill in all fields (see below) before running `setup.sh`. |
+
+### Supported OS versions
+
+**Ubuntu 22.04 LTS and 24.04 LTS only.** Ubuntu 26.04 LTS is **not supported** —
+as of this writing, Percona has not released (or tested) `percona-release`/
+`pmm-client` packages for it. Getting `pmm-client` installed on 26.04 requires
+manually rewriting `apt` package-source distro codenames to point at an
+older release's repo. That happens to work, but it's unverified by Percona
+and can silently break on any Percona-side update — don't do this for a real
+deployment. `setup.sh` prints a warning (not a hard stop) if it detects an
+unsupported OS version, so existing test boxes aren't locked out, but treat
+anything other than 22.04/24.04 as unsupported.
 
 ---
 

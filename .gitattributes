@@ -1,0 +1,8 @@
+# Everything in this repo runs exclusively on Debian/Ubuntu Linux (the sink
+# Droplet, the PMM server). Force LF line endings for everything checked in,
+# regardless of what OS/editor a contributor commits from (e.g. Windows +
+# VS Code, which defaults to CRLF). This travels with the repo via git and
+# applies to every clone/CI run — unlike a personal VS Code "files.eol"
+# setting or a local `git config core.autocrlf`, which only affect one
+# machine and are easy to forget to set up on a fresh clone.
+* text=auto eol=lf
