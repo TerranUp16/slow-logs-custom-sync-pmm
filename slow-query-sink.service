@@ -1,0 +1,32 @@
+[Unit]
+Description=MySQL Slow Query Log Reconstruction Daemon
+Documentation=https://github.com/your-org/slow-logs-custom-sync-pmm
+After=rsyslog.service
+Requires=rsyslog.service
+
+[Service]
+Type=simple
+User=mysqlsink
+Group=mysqlsink
+SupplementaryGroups=adm
+ExecStart=/usr/bin/python3 /var/log/mysql_sink/bin/transform_logs.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Hardening — daemon only needs to read/write under /var/log/mysql_sink
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/log/mysql_sink
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:gemini.google.com)",
+      "Bash(ssh -o StrictHostKeyChecking=no root@178.128.232.115 bash)",
+      "Bash(ssh root@142.93.154.42 'timeout 35 tcpdump -n \"tcp port 6514 and src host 167.99.191.82\" 2>/dev/null | tail -12; echo \"=== rsyslog ===\"; journalctl -u rsyslog --since \"40 seconds ago\" --no-pager | grep -iE \"ssl routines|alert|authenticated|session|error\" | tail -6; echo \"=== incoming ===\"; ls -lh /var/log/mysql_sink/incoming/ 2>/dev/null; echo \"=== tail ===\"; tail -3 /var/log/mysql_sink/incoming/combined_mysql.log 2>/dev/null')",
+      "Bash(scp certs/ca.pem certs/sink-server-cert.pem certs/sink-server-key.pem root@142.93.154.42:/etc/rsyslog.d/tls/)",
+      "Bash(ssh root@142.93.154.42 'set -e *)",
+      "Bash(ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new root@167.99.184.22 \"docker ps -a 2>&1; echo '---'; which docker 2>&1; echo '---'; cat /etc/os-release 2>&1 | head -3\")",
+      "WebFetch(domain:docs.digitalocean.com)"
+    ]
+  }
+}
