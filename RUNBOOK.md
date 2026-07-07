@@ -2,7 +2,10 @@
 
 ## Overview
 
-DigitalOcean Managed MySQL does not expose the filesystem, so PMM cannot tail the slow query log directly. This pipeline routes slow query logs from DO's syslog forwarding feature through a sink Droplet where they are parsed and reconstituted as a native MySQL slow log that PMM can consume.
+DigitalOcean Managed MySQL doesn't expose its filesystem, so PMM can't tail the
+slow query log directly. This pipeline forwards the log via syslog, reconstructs
+it into a real slow-log file on a sink Droplet, and wires that into PMM
+automatically. Full design rationale and component map: [docs/architecture.md](docs/architecture.md).
 
 ```
 DO Managed MySQL (2-node cluster)
@@ -15,7 +18,9 @@ DO Managed MySQL (2-node cluster)
     --> PMM Server QAN
 ```
 
-The daemon (`transform_logs.py`) runs as a persistent systemd service. It tails the incoming file continuously, reconstructs multi-line slow query blocks keyed by `(source_host, block_id)` to avoid collisions between cluster nodes, and writes complete entries to the processed log immediately — no per-minute batch delay.
+`slow-query-sink.service` (`transform_logs.py`) reconstructs multi-line slow-query
+blocks continuously, with no batch delay on this side of the pipeline. (PMM's own
+QAN ingestion has a separate polling interval — see Step 5 and Troubleshooting.)
 
 ---
 
@@ -109,9 +114,9 @@ DO_CA_BUNDLE=/etc/mysql_sink/do-ca.crt
 
 > Download the DO Managed DB **CA certificate** from the database control panel
 > (Connection Details → Download CA certificate) and save it locally as
-> `certs/do-ca.crt`. It rides along with the `gen-certs.sh` output when the repo is
-> copied to the droplet, and `setup.sh` installs it to the `DO_CA_BUNDLE` path. The
-> DB-credential probe verifies the DB cert chain against it (`ssl-mode=VERIFY_CA`).
+> `certs/do-ca.crt`. It rides along when the repo is copied to the droplet, and
+> `setup.sh` installs it to the `DO_CA_BUNDLE` path. The DB-credential probe
+> verifies the DB cert chain against it (`ssl-mode=VERIFY_CA`).
 
 > `.env` is gitignored. Never commit it.
 
@@ -144,43 +149,6 @@ the droplet (used to verify DO's client cert) and obtains a Let's Encrypt server
 cert via certbot (see Step 4). The CA private key (`certs/ca-key.pem`) stays on
 your machine — never commit or deploy it. `certs/` is gitignored.
 
-### How the two TLS directions work (important)
-
-DO's log forwarder and the rsyslog sink authenticate **each other** (mutual TLS),
-and the two directions use **different** trust anchors:
-
-| Direction | Who verifies | Against what | DO panel field / rsyslog setting |
-|-----------|--------------|--------------|----------------------------------|
-| DO verifies the **sink's server cert** | DO forwarder | DO's **system CA bundle** (publicly trusts Let's Encrypt) | DO **CA Certificate** = **blank** |
-| rsyslog verifies **DO's client cert** | rsyslog sink | our **private CA** | rsyslog `CAFile` = `/etc/rsyslog.d/tls/ca.pem` |
-
-The sink presents a **publicly-trusted Let's Encrypt** cert issued for
-`SINK_HOSTNAME`. Because it is publicly trusted, DO's **CA Certificate** field is
-left **blank** and DO verifies it against its built-in system trust store (this is
-what the DO docs mean by "ca — typically not needed"). **This is the only supported
-design** — see the note below on why self-signed is not an option.
-
-> **Hard-won facts (don't re-derive):**
-> - **Always use a hostname + a publicly-trusted (Let's Encrypt) server cert.** This
->   is the only configuration DO accepts. A **private-CA / self-signed server cert is
->   always rejected with `certificate_unknown`** — proven exhaustively (both DNS and
->   IP SANs, `keyCertSign` set, chain vs. leaf, fresh clusters, `ossl` and `gtls`).
->   DO requires the sink cert to chain to a public root; a private CA can't satisfy
->   that. Do not attempt the self-signed path.
-> - Leave DO's **CA Certificate** field **blank**. DO verifies the LE cert via its
->   system bundle. (After saving, DO takes ~1–2 min to redeploy the forwarder before
->   it reconnects; brief silence is normal.)
-> - **DO does NOT clear the CA Certificate field once set** — blanking it in the UI
->   doesn't take; the old value persists. To truly get a blank CA, **create a fresh
->   forwarding destination** (delete + recreate, or a new cluster). A stale value
->   makes DO reject the LE cert with `certificate_unknown` — if a blank CA "isn't
->   working," suspect a cached value first.
-> - The client cert (DO → rsyslog) uses our **private CA** — unrelated to the server
->   side above, and correct to keep.
-> - No public domain? `<IP-dashed>.sslip.io` is a valid `SINK_HOSTNAME` for testing
->   (wildcard DNS: `142-93-154-42.sslip.io` → `142.93.154.42`), so certbot can issue
->   for an IP-only sink via HTTP-01.
-
 ### Log Forwarding (Syslog over mutual TLS)
 
 `setup.sh` obtains a Let's Encrypt cert for `SINK_HOSTNAME` and configures rsyslog to
@@ -201,83 +169,37 @@ Save. Log forwarding starts within ~1–2 minutes (DO redeploys the forwarder af
 a config change). After a cert/destination change, a full disable → save →
 re-enable cycle forces a faster reload.
 
-### Alternative certificate issuance: DNS-01 (private / VPC sinks, no inbound port 80)
-
-`setup.sh` uses certbot's **HTTP-01** challenge (`--standalone`), which requires the
-sink to be **publicly reachable on port 80** and `SINK_HOSTNAME` to resolve to its
-public IP. That's the right default for an internet-facing sink.
-
-Use **DNS-01 instead** when any of these apply:
-
-- The sink lives on a **VPC / private network** and has no public IP or inbound port 80.
-- Port 80 can't be opened (firewall/policy).
-- You want a **wildcard** cert, or to issue the cert **before** the droplet exists.
-
-DNS-01 proves domain control via a `_acme-challenge` **TXT record** — it needs **no
-inbound connectivity to the sink at all**. The sink still presents the resulting
-publicly-trusted cert; DO still validates it against its system bundle (CA field
-blank). The only requirement is that `SINK_HOSTNAME` resolves to an address DO's
-forwarder can reach (a private VPC IP is fine — DO forwards over the VPC).
-
-**Issuing with DNS-01.** Two options:
-
-1. **DNS provider plugin (automated, renews unattended).** If your DNS is with a
-   supported provider (Cloudflare, Route 53, DigitalOcean DNS, etc.), install the
-   matching plugin and supply API credentials:
-   ```bash
-   apt-get install -y certbot python3-certbot-dns-digitalocean
-   printf 'dns_digitalocean_token = %s\n' "$DO_DNS_TOKEN" > /root/.secrets/do.ini
-   chmod 600 /root/.secrets/do.ini
-   certbot certonly \
-     --dns-digitalocean --dns-digitalocean-credentials /root/.secrets/do.ini \
-     --non-interactive --agree-tos -m "$LETSENCRYPT_EMAIL" -d "$SINK_HOSTNAME"
-   ```
-   (Swap `digitalocean` for `cloudflare`/`route53`/etc. and the corresponding
-   credentials file. Renewal is automatic via the certbot timer — no port 80.)
-
-2. **Manual DNS-01 (one-off, e.g. no plugin for your provider).** certbot prints a
-   TXT record to create; add it, then continue:
-   ```bash
-   certbot certonly --manual --preferred-challenges dns \
-     --non-interactive --agree-tos -m "$LETSENCRYPT_EMAIL" -d "$SINK_HOSTNAME"
-   ```
-   > Manual issuance does **not** auto-renew — you'll repeat the TXT step every ~60
-   > days. Prefer a provider plugin for anything long-lived.
-
-**Wiring it into the deployment.** Obtain the cert with one of the above *before* (or
-instead of) the certbot step in `setup.sh`, so the cert already exists at
-`/etc/letsencrypt/live/$SINK_HOSTNAME/`. `setup.sh` detects an existing cert
-(`if [ -f "${LE_LIVE}/fullchain.pem" ]`) and skips fresh issuance, then copies it
-into `/etc/rsyslog.d/tls/` and installs the same renewal deploy hook. So the rest of
-the pipeline (rsyslog config, DO panel, blank CA field) is **identical** — only the
-challenge type differs. Everything else in this runbook applies unchanged.
+> Deploying to a private/VPC sink with no public port 80, or want to know why
+> these specific field values (blank CA, `ossl` driver, `sslip.io` for testing)?
+> See [docs/tls-and-certificates.md](docs/tls-and-certificates.md) — it also
+> covers the DNS-01 alternative to the default HTTP-01 certificate challenge.
 
 ---
 
 ## Step 4 — Deploy the sink Droplet
 
-From this repo directory on your local machine:
+Clone this repo onto the sink Droplet (see the main [README](README.md) for
+one-time git/deploy-key setup), then copy over `.env` and `certs/` — both are
+gitignored, so `git clone` won't bring them:
 
 ```bash
-# Copy repo to droplet (clears stale directory first so re-runs don't nest)
-ssh root@<SINK_IP> "rm -rf /tmp/sink-setup"
-scp -r . root@<SINK_IP>:/tmp/sink-setup
-
-# SSH in and run setup
-ssh root@<SINK_IP> "cd /tmp/sink-setup && bash setup.sh"
+git clone git@github.com:<your-org-or-user>/slow-logs-custom-sync-pmm.git
+scp .env root@<SINK_IP>:~/slow-logs-custom-sync-pmm/.env
+scp certs/* root@<SINK_IP>:~/slow-logs-custom-sync-pmm/certs/
+ssh root@<SINK_IP> "cd slow-logs-custom-sync-pmm && bash setup.sh"
 ```
 
 `setup.sh` does the following automatically:
-1. Creates a dedicated `mysqlsink` service user and `/var/log/mysql_sink/{bin,incoming,processed}` with least-privilege ownership (`750`).
-2. Deploys `transform_logs.py` to the bin directory.
-3. Installs `rsyslog-gnutls`, deploys the CA + sink server cert, and configures rsyslog to receive **mutual-TLS** syslog on port 6514 (rejecting any sender without a CA-signed client cert).
-4. Installs `socat` and creates a systemd service proxying `127.0.0.1:25060` → the DO managed DB host (PMM needs a local-looking host to enable slowlog parsing).
-5. Installs and starts `slow-query-sink.service` (replaces the old per-minute cron job).
-6. Configures logrotate (daily, 14-day retention for processed log; daily, 3-day retention for incoming log with rsyslog HUP postrotate).
-7. Installs `pmm-client` via the Percona apt repository (skipped if already installed).
-8. Registers the node with the PMM server.
-9. Queries the DB to find the `slow_query_log_file` path and creates a symlink pointing it at the processed log.
-10. Registers the MySQL service in PMM with `--query-source=slowlog`.
+1. Checks this is a supported Ubuntu version (warns, doesn't block, if not), then verifies direct DB connectivity before making any changes.
+2. Creates the dedicated `mysqlsink` service user and `/var/log/mysql_sink/{bin,incoming,processed}` with least-privilege ownership.
+3. Deploys `transform_logs.py` and installs `socat`, a MySQL client, `rsyslog-openssl`, and `certbot`.
+4. Deploys the private CA cert, obtains (or reuses) a Let's Encrypt cert for `SINK_HOSTNAME`, and configures rsyslog for mutual-TLS syslog on port 6514 using the `ossl` driver.
+5. Installs `pmm-client`, creates the `socat` proxy service (so PMM connects to the DB via a local-looking address), and starts `slow-query-sink.service`.
+6. Registers the node with PMM Server.
+7. Queries the DB for its `slow_query_log_file` path and symlinks it to the processed log.
+8. Registers the MySQL service in PMM with `--query-source=slowlog`, and verifies it actually appears in `pmm-admin list`.
+
+It's idempotent — safe to re-run after fixing a config issue.
 
 ---
 
@@ -301,9 +223,8 @@ ls -lh /var/log/mysql_sink/incoming/combined_mysql.log
 # Check the daemon is producing output
 tail -f /var/log/mysql_sink/processed/native_slow_query.log
 
-# Confirm the symlink is correct — pulls creds from .env automatically (no more
-# hand-editing <DB_PASS> into a printf), and prints the REAL mysql error on
-# failure instead of silently returning nothing.
+# Confirm the symlink is correct — pulls creds from .env automatically, and
+# prints the REAL mysql error on failure instead of silently returning nothing.
 bash verify-slow-log.sh              # via the socat proxy — what pmm-agent actually uses
 bash verify-slow-log.sh --direct     # bypass the proxy — isolates "is it the proxy, or the DB/firewall?"
 ```
@@ -316,13 +237,25 @@ bash verify-slow-log.sh --direct     # bypass the proxy — isolates "is it the 
 > is broken.
 
 **In PMM UI:**
-- Navigate to **QAN** — queries should appear within seconds of slow queries being generated (no longer a 1-minute batch delay).
+- Navigate to **QAN** and select the `do-managed-mysql` service. See the note below on ingestion lag before assuming something's broken.
 
-**Generate test slow queries** (optional, uses `test_prepared_statements.py`):
+**Generate test slow queries** (optional, uses `test_prepared_statements.py` — this
+is what actually exercises the reason this whole pipeline exists: prepared
+statements, which `performance_schema` QAN cannot see, but slow-log QAN can):
 ```bash
 pip install mysql-connector-python
-python3 test_prepared_statements.py
+set -a; source .env; set +a          # exposes DB_PASS from .env into this shell
+python3 test_prepared_statements.py "$DB_PASS"
 ```
+(The script also accepts `DB_PASS=... python3 test_prepared_statements.py` with no
+positional arg. Either way, a password is required — running it with neither just
+prints its `Usage:` message and exits.)
+
+> **QAN can lag behind the slow log by a minute or so.** The sink daemon
+> (`transform_logs.py`) writes to `native_slow_query.log` immediately, but PMM's
+> own QAN ingestion/aggregation pipeline has its own polling interval on top of
+> that. If `grep` finds your test query in `native_slow_query.log` but QAN hasn't
+> shown it yet, wait a bit before assuming something's broken.
 
 ---
 
@@ -332,21 +265,18 @@ When the managed DB cluster is replaced (new hostname or password):
 
 1. In the DO control panel: update the syslog destination to point to the same sink droplet IP (it may have been reset).
 2. Create the `pmm_monitor` user on the new DB.
-3. Update `.env` with the new `DB_HOST` and `DB_PASS`.
-4. Re-run from your local machine:
-   ```bash
-   scp -r . root@<SINK_IP>:/tmp/sink-setup/
-   ssh root@<SINK_IP> "cd /tmp/sink-setup && bash setup.sh"
-   ```
-   The script is idempotent — it updates the socat service target, recreates the symlink, and re-registers PMM (using `--force` if the node name already exists).
+3. Update `.env` with the new `DB_HOST` and `DB_PASS` (on both your local copy and the sink Droplet's — `.env` is gitignored, so `git pull` won't sync it).
+4. On the sink Droplet: `bash setup.sh`.
+
+The script is idempotent — it updates the socat service target, recreates the symlink, and re-registers PMM (using `--force` if the node name already exists).
 
 ---
 
 ## Re-deploying to a new sink Droplet (existing PMM server)
 
-1. Provision a new Ubuntu droplet.
+1. Provision a new Ubuntu droplet (22.04 LTS or 24.04 LTS).
 2. Update `SINK_IP` in `.env`, and repoint `SINK_HOSTNAME`'s DNS A record at the new droplet IP (keep the same hostname if you can — then DO's forwarding config needs no change).
-3. Copy repo and run `setup.sh` exactly as in Step 4. It obtains a Let's Encrypt cert for `SINK_HOSTNAME` automatically (HTTP-01 needs port 80 reachable and the A record pointing here).
+3. Clone the repo and copy over `.env`/`certs/` as in Step 4, then run `bash setup.sh`. It obtains a Let's Encrypt cert for `SINK_HOSTNAME` automatically (HTTP-01 needs port 80 reachable and the A record pointing here).
 4. If you kept the same `SINK_HOSTNAME`, DO's destination and cert fields need no change. If the hostname changed, update the DO syslog destination to the new name. The CA cert and client cert/key in DO's panel stay the same — no need to re-run `gen-certs.sh` unless you want to rotate the client cert.
 5. Open ports 6514/tcp (syslog) and 80/tcp (ACME) inbound in the new droplet's firewall if one is configured.
 
@@ -394,12 +324,13 @@ against a fresh droplet.
 | `native_slow_query.log` empty after daemon runs | Check `combined_mysql.log` for `[SlowQuery]` lines — slow query log may not be enabled in DO settings |
 | Daemon not running | `systemctl status slow-query-sink` and `journalctl -u slow-query-sink -n 50` |
 | "Discarding stale incomplete block" in daemon logs | A multi-line slow query block arrived with missing lines — likely a transient rsyslog drop; normal at low frequency |
+| `mysql_probe`/`setup.sh` preflight fails with `ERROR 1045 Access denied` | Networking is fine (you got a real MySQL auth response, not a timeout) — this is a credentials issue. Check `DB_PASS` in `.env` matches the current `pmm_monitor` password exactly; if `.env` was ever edited on Windows, check for a stray trailing `\r` (`cat -A .env \| grep DB_PASS` — a `^M` before the line end means CRLF snuck in and is silently corrupting the password when bash sources it: fix with `sed -i 's/\r$//' .env`). Also confirm `pmm_monitor` actually exists on *this* DB cluster, not a previous one. |
 | PMM agents not Running | `journalctl -u pmm-agent -n 50`; verify `PMM_TOKEN` is valid; check PMM server is reachable on port 443 |
-| QAN shows no data | Confirm symlink resolves: `readlink -f <slow_query_log_file path>`; confirm `mysql_slowlog_agent` is Running in `pmm-admin list` |
+| QAN shows no data | First check whether it's just lagging: `grep` the query text in `/var/log/mysql_sink/processed/native_slow_query.log` — if it's there, QAN's own ingestion has a polling delay on top of the sink's real-time write, give it a minute or two. If it's genuinely absent: confirm symlink resolves: `readlink -f <slow_query_log_file path>`; confirm `mysql_slowlog_agent` is Running in `pmm-admin list` |
 | `socat-mysql-proxy` fails to start | Check `DB_HOST` and `DB_PORT` in `/etc/systemd/system/socat-mysql-proxy.service`; test connectivity: `nc -zv <DB_HOST> 25060` |
-| `setup.sh`'s DB preflight/probe fails, or `verify-slow-log.sh` errors | Read the printed checklist (from `mysql_probe` in `common.sh`) — most common cause is the sink Droplet not being in the DB cluster's **Trusted Sources** (Databases → cluster → Settings → Trusted Sources); DO drops the connection with no error visible on this end. Also check the socat proxy (`systemctl status socat-mysql-proxy`), credentials in `.env`, and that the CA cert matches this exact cluster. `setup.sh`'s DB preflight happens before socat exists; `bash verify-slow-log.sh --direct` lets you test the same thing later, bypassing the proxy |
+| `setup.sh`'s DB preflight/probe fails outright (no connection), or `verify-slow-log.sh` errors | Read the printed checklist (from `mysql_probe` in `common.sh`) — most common cause is the sink Droplet not being in the DB cluster's **Trusted Sources** (Databases → cluster → Settings → Trusted Sources); DO drops the connection with no error visible on this end. Also check the socat proxy (`systemctl status socat-mysql-proxy`), credentials in `.env`, and that the CA cert matches this exact cluster. `bash verify-slow-log.sh --direct` bypasses the proxy to isolate proxy vs. DB/firewall |
 | `pmm-admin config` returns "node already exists" | `setup.sh` uses `--force` by default, so re-running the script handles this automatically |
-| Node + agents exist in PMM but no service | `setup.sh` registers the service last; if it exited earlier (e.g. the DB preflight/probe failed), the node/agents from `pmm-admin config` are left orphaned. Fix the earlier failure and re-run `setup.sh` — it's idempotent and will pick up from where it left off. To fully reset first, use `destruct.sh` (below) |
+| Node + agents exist in PMM but no service | `setup.sh` registers the service last; if it exited earlier (e.g. the DB preflight/probe failed), the node/agents from `pmm-admin config` are left orphaned. Fix the earlier failure and re-run `setup.sh` — it's idempotent and will pick up from where it left off. To fully reset first, use `destruct.sh` above |
 | rsyslog silent failure (action suspended/resumed loop) | `/var/log/mysql_sink` ownership must be `syslog:adm` mode `775` — root ownership breaks rsyslog writes |
 
 ---
@@ -411,6 +342,7 @@ against a fresh droplet.
 | `common.sh` | Shared helper library — `mysql_probe()`, used by `setup.sh`, `verify-slow-log.sh`, and `destruct.sh` so DB-connection failures always surface the real error + a troubleshooting checklist instead of being swallowed |
 | `verify-slow-log.sh` | Step 5 verification, automated — resolves `slow_query_log_file` and checks the symlink. Supports `--direct` to bypass the socat proxy |
 | `destruct.sh` | Tears down everything `setup.sh` created (PMM node/service/agents, systemd units, rsyslog config, log dirs, symlink) so a re-run of `setup.sh` starts clean. See "Tearing down / starting over" above |
+| `test_prepared_statements.py` | Generates prepared-statement slow queries to validate the pipeline captures what `performance_schema` QAN cannot |
 
 ## Key files on the sink Droplet
 

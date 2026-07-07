@@ -7,7 +7,9 @@ are captured in the slow query log forwarded via syslog, since
 performance_schema does NOT log these.
 
 Connects via socat proxy on the sink droplet (127.0.0.1:25060).
-Run on sink-experiment: python3 test_prepared_statements.py
+Requires the pmm_monitor DB password, either way:
+  python3 test_prepared_statements.py "$DB_PASS"
+  DB_PASS=... python3 test_prepared_statements.py
 """
 
 import os
