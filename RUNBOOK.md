@@ -94,13 +94,9 @@ SSH into the sink Droplet and clone the repo there — this is the directory
 
 ```bash
 ssh root@<SINK_IP>
-git clone https://github.com/<your-org-or-user>/slow-logs-custom-sync-pmm.git
+git clone git@github.com:TerranUp16/slow-logs-custom-sync-pmm.git
 cd slow-logs-custom-sync-pmm
 ```
-
-No git access set up on the sink Droplet yet? See the main [README](README.md)
-for one-time git/deploy-key setup — a read-only deploy key is the right scope
-for a server that only ever pulls.
 
 `.env` and `certs/` are gitignored, so this clone won't bring them over —
 you'll fill those in locally over the next two steps, then copy them across
@@ -108,9 +104,9 @@ in Step 5.
 
 ---
 
-## Step 3 — Fill in `.env`
+## Step 3 — Create and fill in `.env`
 
-Edit `.env` in this repo with all values:
+Create a file called `.env` in the `slow-logs-custom-sync-pmm` on your sink Droplet. Populate all the below values:
 
 ```dotenv
 DB_HOST=<managed-db-hostname>.db.ondigitalocean.com
@@ -133,13 +129,11 @@ DO_CA_BUNDLE=/etc/mysql_sink/do-ca.crt
 > forwarding. It **must** resolve publicly (A record) to `SINK_IP`. For a quick test
 > with no domain, use `<IP-dashed>.sslip.io` (e.g. `142-93-154-42.sslip.io`).
 
-> Download the DO Managed DB **CA certificate** from the database control panel
+> Download the [DO Managed DB **CA certificate** from the database control panel](https://docs.digitalocean.com/products/databases/mysql/how-to/connect/#download-the-ssl-encryption)
 > (Connection Details → Download CA certificate) and save it locally as
 > `certs/do-ca.crt`. It rides along when the repo is copied to the droplet, and
 > `setup.sh` installs it to the `DO_CA_BUNDLE` path. The DB-credential probe
 > verifies the DB cert chain against it (`ssl-mode=VERIFY_CA`).
-
-> `.env` is gitignored. Never commit it.
 
 ---
 
@@ -147,19 +141,19 @@ DO_CA_BUNDLE=/etc/mysql_sink/do-ca.crt
 
 ### Advanced Configuration
 
-In the DO control panel, go to **Databases → your cluster → Settings → Advanced Configuration** and set:
+In the DO control panel, go to [**Databases → your cluster → Settings → Advanced Configuration**](https://docs.digitalocean.com/products/databases/mysql/how-to/reconfigure/#update-a-databases-configuration-using-the-control-panel) and set:
 
 | Setting | Value | Notes |
 |---------|-------|-------|
 | `slow_query_log` | `on` | Enables slow query logging |
-| `log_output` | `INSIGHTS` | **Required** — DO's abstraction for `FILE`; if set to `TABLE`, slow queries are not forwarded via syslog |
-| `long_query_time` | `0` | Captures all queries during testing; raise to `1`–`2` for production |
+| `log_output` | `INSIGHTS` | **Required** — DO's abstraction for `FILE`; if set to `TABLE`, slow queries are not forwarded via syslog. NOTE- due to a bug, if this has never been changed on the cluster yet, this will show as `INSIGHTS`, but it is actually set to `TABLE`. Set this to any other value, save the change, and then change this to `INSIGHTS` and save the configuration change to properly apply `INSIGHTS` setting. Note you can verify if this is set correctly by checking `SELECT @@log_output;` on your MySQL command-line- you want to see `FILE` instead of `TABLE` from this command's output |
+| `long_query_time` | `0` | Captures all queries |
 
 Save and wait ~30 seconds for the settings to apply.
 
 ### Generate mTLS certificates (before configuring forwarding)
 
-Run locally, from this repo directory:
+Run on the sink Droplet, from this repo directory:
 
 ```bash
 ./gen-certs.sh    # writes certs/ca.pem + certs/do-client-{cert,key}.pem
