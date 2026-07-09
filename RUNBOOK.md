@@ -20,7 +20,7 @@ DO Managed MySQL (2-node cluster)
 
 `slow-query-sink.service` (`transform_logs.py`) reconstructs multi-line slow-query
 blocks continuously, with no batch delay on this side of the pipeline. (PMM's own
-QAN ingestion has a separate polling interval — see Step 5 and Troubleshooting.)
+QAN ingestion has a separate polling interval — see Step 6 and Troubleshooting.)
 
 ---
 
@@ -51,7 +51,7 @@ anything other than 22.04/24.04 as unsupported.
 
 ## Step 1 — Provision and configure the PMM Server Droplet
 
-SSH into the new PMM server droplet and run the Percona easy-install script (NOTE- this can be skipped if you used the [DO Marketplace PMM deployment](https://marketplace.digitalocean.com/apps/percona-monitoring-and-management):
+SSH into the new PMM server droplet and run the Percona easy-install script (NOTE- this can be skipped if you used the [DO Marketplace PMM deployment](https://marketplace.digitalocean.com/apps/percona-monitoring-and-management)):
 
 ```bash
 curl -fsSL https://www.percona.com/get/pmm | bash
@@ -87,7 +87,28 @@ This installs Docker and starts the PMM server container automatically. Wait ~60
 
 ---
 
-## Step 2 — Fill in `.env`
+## Step 2 — Clone the repo onto the sink Droplet
+
+SSH into the sink Droplet and clone the repo there — this is the directory
+`setup.sh` (and later `destruct.sh`/`verify-slow-log.sh`) will run from:
+
+```bash
+ssh root@<SINK_IP>
+git clone https://github.com/<your-org-or-user>/slow-logs-custom-sync-pmm.git
+cd slow-logs-custom-sync-pmm
+```
+
+No git access set up on the sink Droplet yet? See the main [README](README.md)
+for one-time git/deploy-key setup — a read-only deploy key is the right scope
+for a server that only ever pulls.
+
+`.env` and `certs/` are gitignored, so this clone won't bring them over —
+you'll fill those in locally over the next two steps, then copy them across
+in Step 5.
+
+---
+
+## Step 3 — Fill in `.env`
 
 Edit `.env` in this repo with all values:
 
@@ -122,7 +143,7 @@ DO_CA_BUNDLE=/etc/mysql_sink/do-ca.crt
 
 ---
 
-## Step 3 — Configure DO Managed DB
+## Step 4 — Configure DO Managed DB
 
 ### Advanced Configuration
 
@@ -146,7 +167,7 @@ Run locally, from this repo directory:
 
 This creates a private CA and the DO client cert. `setup.sh` deploys `ca.pem` to
 the droplet (used to verify DO's client cert) and obtains a Let's Encrypt server
-cert via certbot (see Step 4). The CA private key (`certs/ca-key.pem`) stays on
+cert via certbot (see Step 5). The CA private key (`certs/ca-key.pem`) stays on
 your machine — never commit or deploy it. `certs/` is gitignored.
 
 ### Log Forwarding (Syslog over mutual TLS)
@@ -176,14 +197,13 @@ re-enable cycle forces a faster reload.
 
 ---
 
-## Step 4 — Deploy the sink Droplet
+## Step 5 — Deploy the sink Droplet
 
-Clone this repo onto the sink Droplet (see the main [README](README.md) for
-one-time git/deploy-key setup), then copy over `.env` and `certs/` — both are
-gitignored, so `git clone` won't bring them:
+You already cloned the repo onto the sink Droplet in Step 2. Now copy over
+the `.env` and `certs/` you filled in during Steps 3–4 — both are gitignored,
+so `git clone`/`git pull` never bring them along — and run `setup.sh`:
 
 ```bash
-git clone git@github.com:<your-org-or-user>/slow-logs-custom-sync-pmm.git
 scp .env root@<SINK_IP>:~/slow-logs-custom-sync-pmm/.env
 scp certs/* root@<SINK_IP>:~/slow-logs-custom-sync-pmm/certs/
 ssh root@<SINK_IP> "cd slow-logs-custom-sync-pmm && bash setup.sh"
@@ -203,7 +223,7 @@ It's idempotent — safe to re-run after fixing a config issue.
 
 ---
 
-## Step 5 — Verify
+## Step 6 — Verify
 
 **On the sink droplet:**
 
@@ -276,7 +296,7 @@ The script is idempotent — it updates the socat service target, recreates the 
 
 1. Provision a new Ubuntu droplet (22.04 LTS or 24.04 LTS).
 2. Update `SINK_IP` in `.env`, and repoint `SINK_HOSTNAME`'s DNS A record at the new droplet IP (keep the same hostname if you can — then DO's forwarding config needs no change).
-3. Clone the repo and copy over `.env`/`certs/` as in Step 4, then run `bash setup.sh`. It obtains a Let's Encrypt cert for `SINK_HOSTNAME` automatically (HTTP-01 needs port 80 reachable and the A record pointing here).
+3. Clone the repo onto the new Droplet (Step 2) and copy over `.env`/`certs/` as in Step 5, then run `bash setup.sh`. It obtains a Let's Encrypt cert for `SINK_HOSTNAME` automatically (HTTP-01 needs port 80 reachable and the A record pointing here).
 4. If you kept the same `SINK_HOSTNAME`, DO's destination and cert fields need no change. If the hostname changed, update the DO syslog destination to the new name. The CA cert and client cert/key in DO's panel stay the same — no need to re-run `gen-certs.sh` unless you want to rotate the client cert.
 5. Open ports 6514/tcp (syslog) and 80/tcp (ACME) inbound in the new droplet's firewall if one is configured.
 
@@ -340,7 +360,7 @@ against a fresh droplet.
 | Path | Purpose |
 |------|---------|
 | `common.sh` | Shared helper library — `mysql_probe()`, used by `setup.sh`, `verify-slow-log.sh`, and `destruct.sh` so DB-connection failures always surface the real error + a troubleshooting checklist instead of being swallowed |
-| `verify-slow-log.sh` | Step 5 verification, automated — resolves `slow_query_log_file` and checks the symlink. Supports `--direct` to bypass the socat proxy |
+| `verify-slow-log.sh` | Step 6 verification, automated — resolves `slow_query_log_file` and checks the symlink. Supports `--direct` to bypass the socat proxy |
 | `destruct.sh` | Tears down everything `setup.sh` created (PMM node/service/agents, systemd units, rsyslog config, log dirs, symlink) so a re-run of `setup.sh` starts clean. See "Tearing down / starting over" above |
 | `test_prepared_statements.py` | Generates prepared-statement slow queries to validate the pipeline captures what `performance_schema` QAN cannot |
 

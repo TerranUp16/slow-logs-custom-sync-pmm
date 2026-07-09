@@ -88,5 +88,5 @@ which challenge type issued the cert.
 
 ---
 
-See [../RUNBOOK.md](../RUNBOOK.md) Step 3 for where these settings get
+See [../RUNBOOK.md](../RUNBOOK.md) Step 4 for where these settings get
 applied, and [architecture.md](architecture.md) for the rest of the pipeline.

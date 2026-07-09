@@ -47,7 +47,7 @@ Full design rationale and pipeline diagram: [docs/architecture.md](docs/architec
 4. **Configure `.env`** — see [Configuration](#configuration-env) below.
 5. **Configure DO Managed MySQL**: enable slow query log, set
    `log_output=INSIGHTS`, and set up mutual-TLS log forwarding to the sink.
-   Full steps: [RUNBOOK.md, Step 3](RUNBOOK.md#step-3--configure-do-managed-db).
+   Full steps: [RUNBOOK.md, Step 4](RUNBOOK.md#step-4--configure-do-managed-db).
 6. **Deploy to the sink Droplet and run setup**:
    ```bash
    git clone git@github.com:<your-org-or-user>/slow-logs-custom-sync-pmm.git
@@ -71,7 +71,7 @@ Copy `env.example` to `.env` and fill in:
 | `DO_CA_BUNDLE` | Where the DO Managed DB CA cert lands on the sink Droplet (default is fine) |
 
 `.env` is gitignored — never commit it. Full field-by-field details:
-[RUNBOOK.md, Step 2](RUNBOOK.md#step-2--fill-in-env).
+[RUNBOOK.md, Step 3](RUNBOOK.md#step-3--fill-in-env).
 
 ## Usage: `setup.sh`
 
