@@ -37,7 +37,7 @@ Full design rationale and pipeline diagram: [docs/architecture.md](docs/architec
    ```
 2. **Clone this repo** — locally, to fill in config, and onto the sink Droplet:
    ```bash
-   git clone git@github.com:<your-org-or-user>/slow-logs-custom-sync-pmm.git
+   git clone git@github.com:TerranUp16/slow-logs-custom-sync-pmm.git
    cd slow-logs-custom-sync-pmm
    ```
 3. **Generate mTLS certificates** (run locally, before configuring DO log forwarding):
