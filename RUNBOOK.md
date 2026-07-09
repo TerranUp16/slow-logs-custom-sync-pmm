@@ -99,8 +99,10 @@ cd slow-logs-custom-sync-pmm
 ```
 
 `.env` and `certs/` are gitignored, so this clone won't bring them over —
-you'll fill those in locally over the next two steps, then copy them across
-in Step 5.
+you'll create both directly on this Droplet over the next two steps. Nothing
+in this runbook requires a separate laptop/dev machine or file transfer
+between machines; everything happens in this one SSH session (plus a
+browser for the DO and PMM control panels).
 
 ---
 
@@ -129,11 +131,17 @@ DO_CA_BUNDLE=/etc/mysql_sink/do-ca.crt
 > forwarding. It **must** resolve publicly (A record) to `SINK_IP`. For a quick test
 > with no domain, use `<IP-dashed>.sslip.io` (e.g. `142-93-154-42.sslip.io`).
 
-> Download the [DO Managed DB **CA certificate** from the database control panel](https://docs.digitalocean.com/products/databases/mysql/how-to/connect/#download-the-ssl-encryption)
-> (Connection Details → Download CA certificate) and save it locally as
-> `certs/do-ca.crt`. It rides along when the repo is copied to the droplet, and
-> `setup.sh` installs it to the `DO_CA_BUNDLE` path. The DB-credential probe
-> verifies the DB cert chain against it (`ssl-mode=VERIFY_CA`).
+> Open the [DO Managed DB **CA certificate** in the database control panel](https://docs.digitalocean.com/products/databases/mysql/how-to/connect/#download-the-ssl-encryption)
+> (Connection Details → Download CA certificate). Rather than downloading it
+> to a separate machine, paste its contents directly into a file on the sink
+> Droplet, in the same SSH session — e.g.:
+> ```bash
+> mkdir -p certs
+> cat > certs/do-ca.crt   # paste the certificate contents, then press Ctrl-D
+> ```
+> Like `certs/ca.pem`, this file is gitignored and never travels via git.
+> `setup.sh` installs it to the `DO_CA_BUNDLE` path, and the DB-credential
+> probe verifies the DB cert chain against it (`ssl-mode=VERIFY_CA`).
 
 ---
 
@@ -153,16 +161,34 @@ Save and wait ~30 seconds for the settings to apply.
 
 ### Generate mTLS certificates (before configuring forwarding)
 
-Run on the sink Droplet, from this repo directory:
+Still on the sink Droplet, from this repo directory:
 
 ```bash
-./gen-certs.sh    # writes certs/ca.pem + certs/do-client-{cert,key}.pem
+./gen-certs.sh    # writes certs/ca.pem, certs/ca-key.pem, certs/do-client-{cert,key}.pem
 ```
 
-This creates a private CA and the DO client cert. `setup.sh` deploys `ca.pem` to
-the droplet (used to verify DO's client cert) and obtains a Let's Encrypt server
-cert via certbot (see Step 5). The CA private key (`certs/ca-key.pem`) stays on
-your machine — never commit or deploy it. `certs/` is gitignored.
+This creates a private CA and the DO client cert **directly on this
+Droplet** — no separate machine involved, and nothing to transfer
+afterward. `setup.sh` will read `certs/ca.pem` straight out of this checkout
+in Step 5.
+
+This design deliberately uses a single, non-HA sink Droplet (see
+[docs/architecture.md](docs/architecture.md)), so there's no need to keep
+the CA authority anywhere else or make it portable between machines. If this
+Droplet is ever rebuilt, just re-run `gen-certs.sh` there and re-paste the
+new client cert into DO's control panel below — a few minutes of manual
+work, not a design problem to solve around.
+
+Of the four files this produces:
+
+| File | Where it's used | Notes |
+|------|------------------|-------|
+| `ca.pem` | This Droplet — `setup.sh` installs it to `/etc/rsyslog.d/tls/ca.pem` to verify DO's client cert | Safe to leave here |
+| `do-client-cert.pem` / `do-client-key.pem` | DO's control panel only | Paste into the Log Forwarding form below (`cat certs/do-client-cert.pem`, `cat certs/do-client-key.pem`) — `setup.sh` never reads these |
+| `ca-key.pem` | Nowhere else. Stays on this Droplet, full stop. | Never commit it, never copy it to another machine |
+
+(`certs/do-ca.crt` — the DO Managed DB's own CA cert from Step 3 — lives
+alongside these but isn't produced by `gen-certs.sh`.)
 
 ### Log Forwarding (Syslog over mutual TLS)
 
@@ -177,8 +203,8 @@ In the DO control panel, go to **Databases → your cluster → Settings → Log
 - **Format:** `RFC3164`
 - **TLS:** **enabled**, with:
   - **CA Certificate** = **leave blank** (DO trusts the Let's Encrypt server cert via its system bundle)
-  - **Client Certificate** = `certs/do-client-cert.pem`
-  - **Client Key** = `certs/do-client-key.pem`
+  - **Client Certificate** = paste the contents of `certs/do-client-cert.pem` (`cat certs/do-client-cert.pem` on the sink Droplet, copy the output)
+  - **Client Key** = paste the contents of `certs/do-client-key.pem` (`cat certs/do-client-key.pem`)
 
 Save. Log forwarding starts within ~1–2 minutes (DO redeploys the forwarder after
 a config change). After a cert/destination change, a full disable → save →
@@ -193,14 +219,12 @@ re-enable cycle forces a faster reload.
 
 ## Step 5 — Deploy the sink Droplet
 
-You already cloned the repo onto the sink Droplet in Step 2. Now copy over
-the `.env` and `certs/` you filled in during Steps 3–4 — both are gitignored,
-so `git clone`/`git pull` never bring them along — and run `setup.sh`:
+Everything `setup.sh` needs — the repo, `.env`, and `certs/ca.pem`/`certs/do-ca.crt`
+— is already on the sink Droplet from Steps 2–4. Nothing to copy or transfer.
+Just run it, still in the same SSH session:
 
 ```bash
-scp .env root@<SINK_IP>:~/slow-logs-custom-sync-pmm/.env
-scp certs/* root@<SINK_IP>:~/slow-logs-custom-sync-pmm/certs/
-ssh root@<SINK_IP> "cd slow-logs-custom-sync-pmm && bash setup.sh"
+bash setup.sh
 ```
 
 `setup.sh` does the following automatically:
@@ -279,7 +303,7 @@ When the managed DB cluster is replaced (new hostname or password):
 
 1. In the DO control panel: update the syslog destination to point to the same sink droplet IP (it may have been reset).
 2. Create the `pmm_monitor` user on the new DB.
-3. Update `.env` with the new `DB_HOST` and `DB_PASS` (on both your local copy and the sink Droplet's — `.env` is gitignored, so `git pull` won't sync it).
+3. On the sink Droplet, update `.env` with the new `DB_HOST` and `DB_PASS`.
 4. On the sink Droplet: `bash setup.sh`.
 
 The script is idempotent — it updates the socat service target, recreates the symlink, and re-registers PMM (using `--force` if the node name already exists).
@@ -288,11 +312,34 @@ The script is idempotent — it updates the socat service target, recreates the 
 
 ## Re-deploying to a new sink Droplet (existing PMM server)
 
+This is a single, non-HA Droplet by design (see
+[docs/architecture.md](docs/architecture.md)) — there's no standby to fail
+over to, so replacing it means standing up a fresh one from scratch and
+re-pointing DO at it. Because `gen-certs.sh` runs per-Droplet, the new
+Droplet mints its **own new CA and client cert** — DO's Log Forwarding panel
+needs updating, it isn't a no-op this time:
+
 1. Provision a new Ubuntu droplet (22.04 LTS or 24.04 LTS).
-2. Update `SINK_IP` in `.env`, and repoint `SINK_HOSTNAME`'s DNS A record at the new droplet IP (keep the same hostname if you can — then DO's forwarding config needs no change).
-3. Clone the repo onto the new Droplet (Step 2) and copy over `.env`/`certs/` as in Step 5, then run `bash setup.sh`. It obtains a Let's Encrypt cert for `SINK_HOSTNAME` automatically (HTTP-01 needs port 80 reachable and the A record pointing here).
-4. If you kept the same `SINK_HOSTNAME`, DO's destination and cert fields need no change. If the hostname changed, update the DO syslog destination to the new name. The CA cert and client cert/key in DO's panel stay the same — no need to re-run `gen-certs.sh` unless you want to rotate the client cert.
-5. Open ports 6514/tcp (syslog) and 80/tcp (ACME) inbound in the new droplet's firewall if one is configured.
+2. On the new Droplet: clone the repo (Step 2), create and fill in `.env`
+   (Step 3) — using the same `DB_HOST`/`DB_PASS`, and the new Droplet's own
+   `SINK_IP` — and repoint `SINK_HOSTNAME`'s DNS A record at the new droplet's
+   IP (keep the same hostname if you can — DO's log-forwarding *destination*
+   field then needs no change).
+3. Run `./gen-certs.sh` on the new Droplet. This mints a brand-new private CA
+   and client cert — it does **not** reuse anything from the old Droplet.
+4. In DO's control panel (Step 4's Log Forwarding section), update the
+   **Client Certificate** and **Client Key** fields to the new Droplet's
+   `certs/do-client-cert.pem`/`do-client-key.pem` contents. If `SINK_HOSTNAME`
+   changed, also update the destination. **CA Certificate** stays blank as
+   before.
+5. Run `bash setup.sh` on the new Droplet (Step 5). It obtains a fresh Let's
+   Encrypt cert for `SINK_HOSTNAME` (HTTP-01 needs port 80 reachable and the
+   A record pointing here).
+6. Open ports 6514/tcp (syslog) and 80/tcp (ACME) inbound in the new
+   droplet's firewall if one is configured.
+7. Decommission the old Droplet once QAN is confirmed flowing from the new
+   one. Its CA/client cert are no longer trusted by DO once step 4 is saved,
+   so there's no cleanup needed on DO's side beyond that field update.
 
 ---
 

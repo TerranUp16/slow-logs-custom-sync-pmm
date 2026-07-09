@@ -27,7 +27,10 @@ Full design rationale and pipeline diagram: [docs/architecture.md](docs/architec
   [sslip.io](https://sslip.io) address for testing).
 - DO Managed MySQL with slow query log enabled, and a `pmm_monitor` DB user
   created.
-- `git` and an SSH key for cloning this repo onto the sink Droplet.
+- An SSH key for cloning this repo onto the sink Droplet — no other machine
+  is needed. This is a single, non-HA sink Droplet by design (see
+  [docs/architecture.md](docs/architecture.md)); everything below runs in
+  one SSH session on it.
 
 ## Install (Ubuntu 24.04 LTS)
 
@@ -35,25 +38,24 @@ Full design rationale and pipeline diagram: [docs/architecture.md](docs/architec
    ```bash
    curl -fsSL https://www.percona.com/get/pmm | bash
    ```
-2. **Clone this repo** — locally, to fill in config, and onto the sink Droplet:
+2. **Provision the sink Droplet, SSH in, and clone this repo there**:
    ```bash
+   ssh root@<SINK_IP>
    git clone git@github.com:TerranUp16/slow-logs-custom-sync-pmm.git
    cd slow-logs-custom-sync-pmm
    ```
-3. **Generate mTLS certificates** (run locally, before configuring DO log forwarding):
+3. **Create and fill in `.env`** — see [Configuration](#configuration-env) below.
+4. **Generate mTLS certificates**, directly on the sink Droplet:
    ```bash
    ./gen-certs.sh
    ```
-4. **Configure `.env`** — see [Configuration](#configuration-env) below.
 5. **Configure DO Managed MySQL**: enable slow query log, set
-   `log_output=INSIGHTS`, and set up mutual-TLS log forwarding to the sink.
+   `log_output=INSIGHTS`, and set up mutual-TLS log forwarding to the sink
+   (pasting the cert/key `gen-certs.sh` just produced into DO's panel).
    Full steps: [RUNBOOK.md, Step 4](RUNBOOK.md#step-4--configure-do-managed-db).
-6. **Deploy to the sink Droplet and run setup**:
+6. **Run setup**, still in the same SSH session:
    ```bash
-   git clone git@github.com:<your-org-or-user>/slow-logs-custom-sync-pmm.git
-   scp .env root@<SINK_IP>:~/slow-logs-custom-sync-pmm/.env
-   scp certs/* root@<SINK_IP>:~/slow-logs-custom-sync-pmm/certs/
-   ssh root@<SINK_IP> "cd slow-logs-custom-sync-pmm && bash setup.sh"
+   bash setup.sh
    ```
 
 Full step-by-step — including PMM API tokens, DNS-01 certs for private/VPC

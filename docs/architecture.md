@@ -59,6 +59,38 @@ are written to the processed log as soon as they're assembled, so there's no
 batching delay on the sink's side of the pipeline — any remaining lag you see
 in QAN is PMM's own ingestion interval, not this daemon.
 
+## Deployment model: single sink Droplet, no HA
+
+The sink Droplet is intentionally a single, non-clustered resource — no
+horizontal scaling, no standby, no automatic failover. If it goes down, log
+forwarding to QAN stops until it's back, and that downtime is an accepted
+trade-off, not an oversight: for the customer this repo was first built for,
+the value is seeing prepared statements in QAN at all, and they've explicitly
+chosen not to pay for an HA version of this pipeline.
+
+This shapes a few concrete design choices elsewhere in this repo:
+
+- **No separate dev/laptop machine anywhere in the flow.** The repo clone,
+  `.env`, `certs/` (including the private CA from `gen-certs.sh`), and every
+  config value pasted into DO's or PMM's control panels all happen in one SSH
+  session on the sink Droplet itself. There's no multi-machine state to keep
+  in sync, because there's only ever one machine.
+- **The CA `gen-certs.sh` generates is per-Droplet, not portable.** Since
+  there's only ever one sink Droplet in service at a time, there's no need
+  for a shared/portable CA authority that multiple Droplets could present. If
+  the Droplet is rebuilt or replaced, the new one mints its own CA and client
+  cert from scratch, and DO's Log Forwarding panel gets a one-time manual
+  update to match (see RUNBOOK's "Re-deploying to a new sink Droplet").
+- **Recovery is "redeploy," not "failover."** There's no second sink Droplet
+  standing by. Recovering from a lost or corrupted Droplet means provisioning
+  a new one and re-running the same one-session setup flow, not promoting a
+  replica.
+
+If a customer's requirements change and this pipeline needs to become highly
+available, that's a real redesign — a shared/portable CA, externalized `.env`
+and cert storage, and an active/standby or load-balanced sink layer — not a
+config toggle on top of what's here today.
+
 ## Component map
 
 | Component | Runs where | Role |
