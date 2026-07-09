@@ -99,7 +99,7 @@ bash verify-slow-log.sh        # confirms the symlink and DB connectivity
 ## Validate prepared statements are captured
 
 ```bash
-pip install mysql-connector-python
+pip3 install mysql-connector-python --break-system-packages
 set -a; source .env; set +a
 python3 test_prepared_statements.py "$DB_PASS"
 ```
