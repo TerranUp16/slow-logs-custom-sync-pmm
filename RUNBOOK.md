@@ -28,11 +28,11 @@ QAN ingestion has a separate polling interval — see Step 5 and Troubleshooting
 
 | What | Notes |
 |------|-------|
-| **PMM Server Droplet** | **Ubuntu 22.04 LTS or 24.04 LTS** — see "Supported OS versions" below. Minimum 4 GB RAM (8 GB recommended). Must be provisioned and reachable before running `setup.sh`. |
-| **Sink Droplet** | **Ubuntu 22.04 LTS or 24.04 LTS** — see "Supported OS versions" below. Any size. This is where `setup.sh` runs. |
+| **PMM Server Droplet** | **Ubuntu 22.04 LTS or 24.04 LTS** — see "Supported OS versions" below. Minimum 4 GB RAM (8 GB recommended). Must be provisioned and reachable before running `setup.sh`. Note DigitalOcean offers [a prebuilt Marketplace Droplet to make this deployment easier](https://marketplace.digitalocean.com/apps/percona-monitoring-and-management) |
+| **Sink Droplet** | **Ubuntu 22.04 LTS or 24.04 LTS** — see "Supported OS versions" below. Any size (required size based on database query load; can upscale the Droplet later if initial size guess is too small or weak). This is where `setup.sh` runs. |
 | **DNS hostname for the sink** | A public DNS **A record** pointing at the sink Droplet's IP (e.g. `logs.example.com → <SINK_IP>`). Required — the sink presents a Let's Encrypt cert for this name, and certbot's HTTP-01 challenge needs it to resolve here. No domain handy? `<IP-dashed>.sslip.io` works for testing. |
 | **DO Managed MySQL** | Slow query log must be enabled in the DO control panel (Database → Settings → Slow query log). |
-| **`pmm_monitor` DB user** | Create via DO control panel (Database → Users). DO grants admin-level access by default — no additional `GRANT` statements needed. |
+| **`pmm_monitor` DB user** | Create via DO control panel (Database → Users). DO grants appropriate access by default — no additional `GRANT` statements needed. |
 | **`.env` file** | Fill in all fields (see below) before running `setup.sh`. |
 
 ### Supported OS versions
@@ -51,7 +51,7 @@ anything other than 22.04/24.04 as unsupported.
 
 ## Step 1 — Provision and configure the PMM Server Droplet
 
-SSH into the new PMM server droplet and run the Percona easy-install script:
+SSH into the new PMM server droplet and run the Percona easy-install script (NOTE- this can be skipped if you used the [DO Marketplace PMM deployment](https://marketplace.digitalocean.com/apps/percona-monitoring-and-management):
 
 ```bash
 curl -fsSL https://www.percona.com/get/pmm | bash
@@ -74,7 +74,7 @@ This installs Docker and starts the PMM server container automatically. Wait ~60
   4. Go to **Administration → Users and access → Service Accounts → Add
      service account**. Name: anything (e.g. `sink-droplet`), Role: **Admin**.
   5. Open the new service account → **Add service account token** → copy the
-     token (starts with `glsa_`; you will not be able to view it again). Put
+     token (starts with `glsa_`; you will not be able to view it again; strongly recommend storing in a secure password manager). Put
      it into `.env` as `PMM_TOKEN`.
 
   (PMM 3 runs on Grafana 9+, which replaced the old "API Keys" page with
