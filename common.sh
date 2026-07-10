@@ -2,6 +2,60 @@
 # common.sh — shared helpers for setup.sh, verify-slow-log.sh, and destruct.sh.
 # Not meant to be run directly; source it after `set -euo pipefail`.
 
+# Memoized per-process so a script that calls mysql_probe multiple times
+# (setup.sh does: once direct, once through the socat proxy) only checks/
+# installs once instead of re-running apt-get update every time.
+_MYSQL_CLIENT_ENSURED=""
+
+# ensure_mysql_client
+#
+# Makes sure a `mysql` client binary is on PATH, installing `default-mysql-client`
+# via apt if it isn't. A fresh Ubuntu Droplet does not ship one, and setup.sh's
+# DB preflight (the very first real check it runs, by design, so bad
+# DB_HOST/DB_PASS/Trusted-Sources fails fast) runs before setup.sh's own later
+# `apt-get install` block — so without this, that preflight fails with
+# "mysql: command not found" on a completely fresh box, which looks like (but
+# isn't) a DB connectivity problem. Living here means every script that sources
+# common.sh and calls mysql_probe (setup.sh, verify-slow-log.sh, destruct.sh)
+# gets this fixed in one place, regardless of what's been installed so far.
+ensure_mysql_client() {
+  [ -n "$_MYSQL_CLIENT_ENSURED" ] && return 0
+
+  if command -v mysql >/dev/null 2>&1; then
+    _MYSQL_CLIENT_ENSURED=1
+    return 0
+  fi
+
+  echo "==> 'mysql' client not found — installing default-mysql-client" >&2
+
+  if ! command -v apt-get >/dev/null 2>&1; then
+    echo "ERROR: 'mysql' client is missing and apt-get is not available to install it." >&2
+    echo "Install a MySQL client manually (the 'mysql' binary must be on PATH) and re-run." >&2
+    return 1
+  fi
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "ERROR: 'mysql' client is missing and installing it requires root (apt-get)." >&2
+    echo "Re-run as root, or install it yourself first: sudo apt-get install -y default-mysql-client" >&2
+    return 1
+  fi
+
+  if ! DEBIAN_FRONTEND=noninteractive apt-get update -q \
+      || ! DEBIAN_FRONTEND=noninteractive apt-get install -y -q default-mysql-client; then
+    echo "ERROR: Failed to auto-install 'default-mysql-client' via apt-get." >&2
+    echo "Install it manually (apt-get install -y default-mysql-client) and re-run." >&2
+    return 1
+  fi
+
+  if ! command -v mysql >/dev/null 2>&1; then
+    echo "ERROR: apt-get install default-mysql-client succeeded, but 'mysql' is still not on PATH." >&2
+    return 1
+  fi
+
+  echo "  mysql client installed." >&2
+  _MYSQL_CLIENT_ENSURED=1
+  return 0
+}
+
 # mysql_probe USER PASS HOST PORT CA_BUNDLE QUERY
 #
 # Runs a single query against the DB using a 0600 temp options file (so the
@@ -21,6 +75,8 @@
 mysql_probe() {
   local user="$1" pass="$2" host="$3" port="$4" ca="$5" query="$6"
   local defaults_file err_file out rc
+
+  ensure_mysql_client || return 1
 
   defaults_file="$(mktemp)"
   chmod 600 "$defaults_file"

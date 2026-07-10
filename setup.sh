@@ -175,6 +175,10 @@ apt-get update -q
 # handshake with "Decryption has failed", see RUNBOOK). rsyslog-gnutls provides a
 # DIFFERENT driver (lmnsd_gtls) and does not satisfy this; installing it instead
 # leaves imtcp unable to load and the port 6514 listener silently never starts.
+# default-mysql-client is listed here too even though the DB preflight above
+# already triggered ensure_mysql_client() in common.sh on a box that didn't have
+# it yet — this line is then just a fast no-op, kept for a complete/accurate
+# install list.
 apt-get install -y -q socat default-mysql-client rsyslog-openssl certbot
 
 echo "==> Deploying private CA cert for client-cert verification"
