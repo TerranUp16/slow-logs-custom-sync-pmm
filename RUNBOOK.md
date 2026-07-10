@@ -196,7 +196,8 @@ alongside these but isn't produced by `gen-certs.sh`.)
 `setup.sh` obtains a Let's Encrypt cert for `SINK_HOSTNAME` and configures rsyslog to
 present it. Use that **same hostname** as the destination.
 
-In the DO control panel, go to **Databases → your cluster → Settings → Log Forwarding**
+In the DO control panel, [go to **Databases → your cluster → Settings → Log
+Forwarding**](https://docs.digitalocean.com/products/databases/mysql/how-to/forward-logs/)
 and add (or edit) a Rsyslog Destination. The form has these fields, top to bottom —
 field names below match the DO UI exactly:
 
@@ -239,7 +240,7 @@ disable → save → re-enable cycle forces a faster reload.
 
 ---
 
-## Step 5 — Deploy the sink Droplet
+## Step 5 — Deploy slow log integration on the sink Droplet
 
 Everything `setup.sh` needs — the repo, `.env`, and `certs/ca.pem`/`certs/do-ca.crt`
 — is already on the sink Droplet from Steps 2–4. Nothing to copy or transfer.
@@ -299,13 +300,13 @@ bash verify-slow-log.sh --direct     # bypass the proxy — isolates "is it the 
 **In PMM UI:**
 - Navigate to **QAN** and select the `do-managed-mysql` service. See the note below on ingestion lag before assuming something's broken.
 
-**Generate test slow queries** (optional, uses `test_prepared_statements.py` — this
+**Generate test prepared statements** (optional, uses `test_prepared_statements.py` — this
 is what actually exercises the reason this whole pipeline exists: prepared
 statements, which `performance_schema` QAN cannot see, but slow-log QAN can):
 ```bash
-pip install mysql-connector-python
+pip3 install mysql-connector-python --break-system-packages
 set -a; source .env; set +a          # exposes DB_PASS from .env into this shell
-python3 test_prepared_statements.py "$DB_PASS"
+python3 test_prepared_statements.py "${DB_PASS}"
 ```
 (The script also accepts `DB_PASS=... python3 test_prepared_statements.py` with no
 positional arg. Either way, a password is required — running it with neither just
