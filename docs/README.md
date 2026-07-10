@@ -8,6 +8,8 @@ step-by-step flow, but are worth having written down.
 - **[tls-and-certificates.md](tls-and-certificates.md)** — the mutual-TLS
   design between DO and the sink, DO's certificate quirks, and the DNS-01
   alternative for private/VPC sinks.
+- **[sslip.md](sslip.md)** — using sslip.io to get a real, publicly-resolvable
+  hostname for testing without owning a domain.
 
 For deployment steps, start at the main [README](../README.md) or
 [RUNBOOK.md](../RUNBOOK.md).

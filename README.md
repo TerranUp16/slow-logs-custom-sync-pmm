@@ -24,7 +24,8 @@ Full design rationale and pipeline diagram: [docs/architecture.md](docs/architec
   (**Ubuntu 24.04 LTS recommended**; 22.04 LTS also supported — see
   [Supported OS versions](RUNBOOK.md#supported-os-versions)).
 - A public DNS A record pointing at the sink Droplet (or an
-  [sslip.io](https://sslip.io) address for testing).
+  [sslip.io](https://sslip.io) address for testing — see
+  [docs/sslip.md](docs/sslip.md)).
 - DO Managed MySQL with slow query log enabled, and a `pmm_monitor` DB user
   created.
 - An SSH key for cloning this repo onto the sink Droplet — no other machine
@@ -130,3 +131,4 @@ Let's Encrypt cert alone by default. Details:
 - **[RUNBOOK.md](RUNBOOK.md)** — full step-by-step deployment and operational procedures.
 - **[docs/architecture.md](docs/architecture.md)** — why this exists, and how the pipeline works end to end.
 - **[docs/tls-and-certificates.md](docs/tls-and-certificates.md)** — mTLS design, DO's certificate quirks, and the DNS-01 alternative for private/VPC sinks.
+- **[docs/sslip.md](docs/sslip.md)** — using sslip.io to test without owning a domain.

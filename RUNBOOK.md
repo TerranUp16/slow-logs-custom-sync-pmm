@@ -129,7 +129,8 @@ DO_CA_BUNDLE=/etc/mysql_sink/do-ca.crt
 > `SINK_HOSTNAME` is the linchpin of the TLS design: rsyslog presents a Let's Encrypt
 > cert issued for this name, and it is the destination you configure in DO log
 > forwarding. It **must** resolve publicly (A record) to `SINK_IP`. For a quick test
-> with no domain, use `<IP-dashed>.sslip.io` (e.g. `142-93-154-42.sslip.io`).
+> with no domain, use `<IP-dashed>.sslip.io` (e.g. `142-93-154-42.sslip.io`) — see
+> [docs/sslip.md](docs/sslip.md) for a full walkthrough.
 
 > Open the [DO Managed DB **CA certificate** in the database control panel](https://docs.digitalocean.com/products/databases/mysql/how-to/connect/#download-the-ssl-encryption)
 > (Connection Details → Download CA certificate). Rather than downloading it
@@ -195,25 +196,46 @@ alongside these but isn't produced by `gen-certs.sh`.)
 `setup.sh` obtains a Let's Encrypt cert for `SINK_HOSTNAME` and configures rsyslog to
 present it. Use that **same hostname** as the destination.
 
-In the DO control panel, go to **Databases → your cluster → Settings → Log Forwarding**:
+In the DO control panel, go to **Databases → your cluster → Settings → Log Forwarding**
+and add (or edit) a Rsyslog Destination. The form has these fields, top to bottom —
+field names below match the DO UI exactly:
 
-- **Destination:** `SINK_HOSTNAME` (the DNS name — e.g. `logs.example.com`; **not** a raw IP)
-- **Port:** `6514`
-- **Protocol:** `TCP`
-- **Format:** `RFC3164`
-- **TLS:** **enabled**, with:
-  - **CA Certificate** = **leave blank** (DO trusts the Let's Encrypt server cert via its system bundle)
-  - **Client Certificate** = paste the contents of `certs/do-client-cert.pem` (`cat certs/do-client-cert.pem` on the sink Droplet, copy the output)
-  - **Client Key** = paste the contents of `certs/do-client-key.pem` (`cat certs/do-client-key.pem`)
+- **Destination name** — any label; using `SINK_HOSTNAME` itself is fine and keeps
+  things unambiguous.
+- **Endpoint** (required) — `SINK_HOSTNAME` (the DNS name — e.g. `logs.example.com`
+  or your `sslip.io` hostname, see [docs/sslip.md](docs/sslip.md); **not** a raw IP).
+- **Port** (required) — `6514`.
+- **Enable TLS support** — check this box. (There's no separate protocol field —
+  TCP is implied once TLS is enabled.)
+- **Message format** — change this to **`RFC3164`**. **DO's default is not
+  this** (the dropdown defaults to a different format) — you must explicitly
+  change it, or `transform_logs.py` won't recognize the incoming lines and
+  nothing will show up in the processed slow-query log.
+- Click **Show advanced configuration options** to reveal three more fields,
+  collapsed by default:
+  - **CA certificate** = **leave blank** (DO trusts the Let's Encrypt server cert
+    via its own system bundle — don't paste anything here)
+  - **Client key** = paste the full contents of `certs/do-client-key.pem`
+    (`cat certs/do-client-key.pem` on the sink Droplet, copy the output —
+    everything between and including the `BEGIN`/`END PRIVATE KEY` lines)
+  - **Client certificate** = paste the full contents of `certs/do-client-cert.pem`
+    (`cat certs/do-client-cert.pem` — everything between and including the
+    `BEGIN`/`END CERTIFICATE` lines)
 
-Save. Log forwarding starts within ~1–2 minutes (DO redeploys the forwarder after
-a config change). After a cert/destination change, a full disable → save →
-re-enable cycle forces a faster reload.
+Click **Save Destination**. Log forwarding starts within ~1–2 minutes (DO redeploys
+the forwarder after a config change). After a cert/destination change, a full
+disable → save → re-enable cycle forces a faster reload.
+
+> The advanced options are collapsed by default — if you only fill in Endpoint/Port/TLS
+> and save, DO has no client cert to present and the mTLS handshake will fail. Always
+> expand **Show advanced configuration options** and fill in all three fields (CA
+> certificate blank, Client key, Client certificate filled) before saving.
 
 > Deploying to a private/VPC sink with no public port 80, or want to know why
-> these specific field values (blank CA, `ossl` driver, `sslip.io` for testing)?
+> these specific field values (blank CA, `ossl` driver) are what they are?
 > See [docs/tls-and-certificates.md](docs/tls-and-certificates.md) — it also
 > covers the DNS-01 alternative to the default HTTP-01 certificate challenge.
+> No domain to test with? See [docs/sslip.md](docs/sslip.md).
 
 ---
 
