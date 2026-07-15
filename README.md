@@ -42,7 +42,7 @@ Full design rationale and pipeline diagram: [docs/architecture.md](docs/architec
 2. **Provision the sink Droplet, SSH in, and clone this repo there**:
    ```bash
    ssh root@<SINK_IP>
-   git clone git@github.com:TerranUp16/slow-logs-custom-sync-pmm.git
+   git clone git@github.com:DO-Solutions/slow-logs-custom-sync-pmm.git
    cd slow-logs-custom-sync-pmm
    ```
 3. **Create and fill in `.env`** — see [Configuration](#configuration-env) below.
@@ -71,7 +71,12 @@ Copy `env.example` to `.env` and fill in:
 | `DB_HOST`, `DB_PORT`, `DB_PASS`, `PMM_MONITOR_USER` | DO Managed MySQL connection details |
 | `SINK_IP`, `SINK_HOSTNAME`, `LETSENCRYPT_EMAIL` | Sink Droplet's public identity — `SINK_HOSTNAME` must resolve to `SINK_IP` |
 | `PMM_SERVER`, `PMM_TOKEN` | PMM Server address + API token (leave `PMM_TOKEN` blank to auto-mint on a fresh PMM install) |
-| `DO_CA_BUNDLE` | Where the DO Managed DB CA cert lands on the sink Droplet (default is fine) |
+| `DO_CA_BUNDLE` | Where `setup.sh` **installs** the DO Managed DB CA cert on this Droplet (default is fine — leave unset). This is **not** where you put the downloaded cert; paste that into `certs/do-ca.crt` instead (see below) |
+
+Separately, paste the DO Managed DB's CA certificate (Connection Details →
+Download CA certificate in the DO control panel) into `certs/do-ca.crt` in
+this repo directory — this file is gitignored and isn't a `.env` variable.
+`setup.sh` reads it from there and installs a copy to `DO_CA_BUNDLE` above.
 
 `.env` is gitignored — never commit it. Full field-by-field details:
 [RUNBOOK.md, Step 3](RUNBOOK.md#step-3--fill-in-env).

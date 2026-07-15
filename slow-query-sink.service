@@ -1,6 +1,6 @@
 [Unit]
 Description=MySQL Slow Query Log Reconstruction Daemon
-Documentation=https://github.com/your-org/slow-logs-custom-sync-pmm
+Documentation=https://github.com/DO-Solutions/slow-logs-custom-sync-pmm
 After=rsyslog.service
 Requires=rsyslog.service
 

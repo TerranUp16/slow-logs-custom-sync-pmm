@@ -20,9 +20,10 @@ try:
     import mysql.connector
 except ImportError:
     sys.exit(
-        "mysql-connector-python is required. Install it in a virtualenv:\n"
-        "  python3 -m venv .venv && . .venv/bin/activate && pip install mysql-connector-python\n"
-        "then re-run this script."
+        "mysql-connector-python is required. Install it, then re-run this script:\n"
+        "  pip3 install mysql-connector-python --break-system-packages\n"
+        "(or, if you'd rather not touch system packages: python3 -m venv .venv "
+        "&& . .venv/bin/activate && pip install mysql-connector-python)"
     )
 
 HOST = "127.0.0.1"

@@ -12,10 +12,14 @@
 # the sink's server cert against its own system CA bundle (a private/self-signed
 # server cert is always rejected with certificate_unknown).
 #
-# DO log-forwarding fields map to:
+# DO's Log Forwarding fields (under "Show advanced configuration options" --
+# collapsed by default, easy to miss) map to the CONTENTS of these files, not
+# their paths:
 #   CA Certificate     -> LEAVE BLANK (DO trusts the LE server cert via system bundle)
-#   Client Certificate -> certs/do-client-cert.pem
-#   Client Key         -> certs/do-client-key.pem
+#   Client Certificate -> paste contents of certs/do-client-cert.pem
+#   Client Key         -> paste contents of certs/do-client-key.pem
+# Also set Message format = RFC3164 (DO's default is not this, and
+# transform_logs.py's parser requires it).
 #
 # Run this ON the sink Droplet itself, once, right after cloning the repo and
 # filling in .env — before running setup.sh. This design uses a single,
@@ -72,11 +76,15 @@ cat <<EOF
   The rsyslog SERVER cert is a Let's Encrypt cert obtained by setup.sh for
   SINK_HOSTNAME — nothing to generate or paste for that side.
 
-  Paste into DO control panel (Databases -> Logs -> Log Forwarding, TLS):
+  Paste into DO control panel (Databases -> Logs -> Log Forwarding), under
+  "Show advanced configuration options" (collapsed by default -- expand it):
       CA Certificate     = <LEAVE BLANK>   (DO trusts the LE server cert via its system bundle)
-      Client Certificate = certs/do-client-cert.pem
-      Client Key         = certs/do-client-key.pem
-  Destination endpoint  = ${SINK_HOSTNAME:-<SINK_HOSTNAME from .env>}   (a hostname, NOT a raw IP)
+      Client Certificate = <paste the FULL CONTENTS of certs/do-client-cert.pem, not the path>
+                            cat "$OUT/do-client-cert.pem"
+      Client Key         = <paste the FULL CONTENTS of certs/do-client-key.pem, not the path>
+                            cat "$OUT/do-client-key.pem"
+  Endpoint       = ${SINK_HOSTNAME:-<SINK_HOSTNAME from .env>}   (a hostname, NOT a raw IP)
+  Message format = RFC3164   (DO's default is NOT this -- you must change it)
 
   KEEP ON THIS DROPLET ONLY — NEVER COMMIT OR COPY ELSEWHERE: certs/ca-key.pem
 EOF

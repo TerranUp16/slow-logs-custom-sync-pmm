@@ -94,7 +94,7 @@ SSH into the sink Droplet and clone the repo there — this is the directory
 
 ```bash
 ssh root@<SINK_IP>
-git clone git@github.com:TerranUp16/slow-logs-custom-sync-pmm.git
+git clone git@github.com:DO-Solutions/slow-logs-custom-sync-pmm.git
 cd slow-logs-custom-sync-pmm
 ```
 
@@ -457,7 +457,9 @@ applies, rather than you needing to guess from the symptom alone.
 
 | Path | Purpose |
 |------|---------|
-| `common.sh` | Shared helper library — `mysql_probe()`, used by `setup.sh`, `verify-slow-log.sh`, `diagnose.sh`, and `destruct.sh` so DB-connection failures always surface the real error + a troubleshooting checklist instead of being swallowed |
+| `common.sh` | Shared helper library — `mysql_probe()` (auto-installs a MySQL client on first use if one isn't present), used by `setup.sh`, `verify-slow-log.sh`, `diagnose.sh`, and `destruct.sh` so DB-connection failures always surface the real error + a troubleshooting checklist instead of being swallowed |
+| `gen-certs.sh` | Generates the private CA and DO client cert/key for mutual-TLS log forwarding. Run once on the sink Droplet, before `setup.sh`; prints the exact values to paste into DO's Log Forwarding panel |
+| `setup.sh` | Main install script — see Step 5 above |
 | `diagnose.sh` | End-to-end pipeline health check — DB config, rsyslog service/listener/certs/errors, firewall, incoming file growth, daemon status, symlink+target, PMM agent status. Read-only; start here when something's wrong. Supports `--direct` |
 | `verify-slow-log.sh` | Focused symlink verification (also called by `diagnose.sh`) — resolves `slow_query_log_file`, checks the symlink path, AND confirms the target file actually exists (a dangling symlink still "resolves" correctly, so both are checked). Supports `--direct` to bypass the socat proxy |
 | `destruct.sh` | Tears down everything `setup.sh` created (PMM node/service/agents, systemd units, rsyslog config, log dirs, symlink) so a re-run of `setup.sh` starts clean. See "Tearing down / starting over" above |
