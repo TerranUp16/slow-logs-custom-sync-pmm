@@ -122,7 +122,10 @@ LETSENCRYPT_EMAIL=<contact address for the Let's Encrypt account>
 PMM_SERVER=<pmm server IP>
 PMM_TOKEN=<glsa_... token from Step 1, or leave blank to auto-mint on fresh installs>
 
-# Path on the sink Droplet to DO Managed DB CA cert (download from DB control panel)
+# Where setup.sh INSTALLS the DO Managed DB CA cert on this Droplet (default is
+# fine — leave this line out unless you need a non-default path). Do NOT put the
+# downloaded cert here yourself: paste it into certs/do-ca.crt instead (below) —
+# setup.sh copies it from there to this path automatically.
 DO_CA_BUNDLE=/etc/mysql_sink/do-ca.crt
 ```
 
@@ -140,9 +143,12 @@ DO_CA_BUNDLE=/etc/mysql_sink/do-ca.crt
 > mkdir -p certs
 > cat > certs/do-ca.crt   # paste the certificate contents, then press Ctrl-D
 > ```
-> Like `certs/ca.pem`, this file is gitignored and never travels via git.
-> `setup.sh` installs it to the `DO_CA_BUNDLE` path, and the DB-credential
-> probe verifies the DB cert chain against it (`ssl-mode=VERIFY_CA`).
+> Like `certs/ca.pem`, this file is gitignored and never travels via git. It's
+> referred to as `DO_CA_SRC` internally (default `certs/do-ca.crt`, no need to
+> set it explicitly in `.env`) to distinguish it from `DO_CA_BUNDLE` above —
+> `setup.sh` reads the cert from here (`DO_CA_SRC`) and installs a copy to
+> `DO_CA_BUNDLE`, and the DB-credential probe verifies the DB cert chain
+> against it (`ssl-mode=VERIFY_CA`).
 
 ---
 
@@ -266,7 +272,28 @@ It's idempotent — safe to re-run after fixing a config issue.
 
 ## Step 6 — Verify
 
-**On the sink droplet:**
+**Start here — run the full pipeline health check:**
+
+```bash
+bash diagnose.sh              # via the socat proxy — what pmm-agent actually uses
+bash diagnose.sh --direct     # DB stage bypasses the proxy — isolates proxy vs. DB/firewall
+```
+
+`diagnose.sh` walks every stage of the pipeline in order — DB slow-query config,
+rsyslog service/listener/certs, recent rsyslog TLS errors, firewall, whether the
+incoming syslog file exists and is actually growing, the sink daemon, the
+symlink + target file, and the PMM agent status — and prints a clear PASS/WARN/FAIL
+for each with specific remediation. **Read failures top to bottom**: a FAIL early
+on (e.g. rsyslog not listening) is very often the real cause of everything that
+looks broken further down (e.g. no incoming file, daemon parked waiting, PMM
+agent stuck on `Waiting`), not a separate problem to chase individually. This is
+also the tool to reach for if individual checks look OK but something still
+doesn't add up — e.g. the symlink resolving correctly is not proof that any data
+has ever arrived; `diagnose.sh` checks both, and `verify-slow-log.sh` (which it
+calls internally) checks the target file's actual existence, not just the
+symlink path.
+
+Manual/targeted checks, if you want to dig into one specific stage yourself:
 
 ```bash
 # Daemon should be active (running)
@@ -284,8 +311,9 @@ ls -lh /var/log/mysql_sink/incoming/combined_mysql.log
 # Check the daemon is producing output
 tail -f /var/log/mysql_sink/processed/native_slow_query.log
 
-# Confirm the symlink is correct — pulls creds from .env automatically, and
-# prints the REAL mysql error on failure instead of silently returning nothing.
+# Confirm the symlink AND its target file are correct — pulls creds from .env
+# automatically, and prints the REAL mysql error on failure instead of
+# silently returning nothing.
 bash verify-slow-log.sh              # via the socat proxy — what pmm-agent actually uses
 bash verify-slow-log.sh --direct     # bypass the proxy — isolates "is it the proxy, or the DB/firewall?"
 ```
@@ -401,6 +429,10 @@ against a fresh droplet.
 
 ## Troubleshooting
 
+**Run `bash diagnose.sh` first.** It checks the whole pipeline end to end in one
+pass and will usually point straight at which of the rows below actually
+applies, rather than you needing to guess from the symptom alone.
+
 | Symptom | Check |
 |---------|-------|
 | `combined_mysql.log` doesn't exist at all, or exists but isn't growing | No data has ever arrived from DO (or hasn't recently). Check, in order: rsyslog is actually running — `systemctl status rsyslog`; it's listening — `ss -tlnp \| grep 6514`; firewall — `ufw status` (allow 6514/tcp); TLS handshake/cert errors, or a total absence of connection attempts — `journalctl -u rsyslog -n 100` (cert mismatch, expired, or wrong CA in DO panel; no attempts at all usually means DO's Log Forwarding config wasn't actually saved correctly); confirm DO's Log Forwarding destination has TLS enabled AND that **Show advanced configuration options** was expanded with Client key/Client certificate actually pasted in — it's collapsed by default and easy to miss (see Step 4) |
@@ -425,8 +457,9 @@ against a fresh droplet.
 
 | Path | Purpose |
 |------|---------|
-| `common.sh` | Shared helper library — `mysql_probe()`, used by `setup.sh`, `verify-slow-log.sh`, and `destruct.sh` so DB-connection failures always surface the real error + a troubleshooting checklist instead of being swallowed |
-| `verify-slow-log.sh` | Step 6 verification, automated — resolves `slow_query_log_file`, checks the symlink path, AND confirms the target file actually exists (a dangling symlink still "resolves" correctly, so both are checked). Supports `--direct` to bypass the socat proxy |
+| `common.sh` | Shared helper library — `mysql_probe()`, used by `setup.sh`, `verify-slow-log.sh`, `diagnose.sh`, and `destruct.sh` so DB-connection failures always surface the real error + a troubleshooting checklist instead of being swallowed |
+| `diagnose.sh` | End-to-end pipeline health check — DB config, rsyslog service/listener/certs/errors, firewall, incoming file growth, daemon status, symlink+target, PMM agent status. Read-only; start here when something's wrong. Supports `--direct` |
+| `verify-slow-log.sh` | Focused symlink verification (also called by `diagnose.sh`) — resolves `slow_query_log_file`, checks the symlink path, AND confirms the target file actually exists (a dangling symlink still "resolves" correctly, so both are checked). Supports `--direct` to bypass the socat proxy |
 | `destruct.sh` | Tears down everything `setup.sh` created (PMM node/service/agents, systemd units, rsyslog config, log dirs, symlink) so a re-run of `setup.sh` starts clean. See "Tearing down / starting over" above |
 | `test_prepared_statements.py` | Generates prepared-statement slow queries to validate the pipeline captures what `performance_schema` QAN cannot |
 

@@ -94,8 +94,16 @@ idempotent — safe to re-run after fixing a config issue.
 Verify it worked:
 ```bash
 pmm-admin list                 # node + agents should show Running
-bash verify-slow-log.sh        # confirms the symlink and DB connectivity
+bash diagnose.sh                # full pipeline health check — start here if anything looks off
+bash verify-slow-log.sh        # focused symlink + target-file check (diagnose.sh calls this too)
 ```
+
+`setup.sh` can't confirm data is actually flowing end-to-end on its own — DO's
+log forwarder takes ~1-2 minutes to redeploy after its config is saved, and
+generating a real slow-query workload isn't this script's job. `diagnose.sh`
+is the follow-up: it checks every stage of the pipeline (DB config, rsyslog,
+TLS certs, firewall, the incoming/processed log files, and PMM agent status)
+and reports exactly where it's stuck if something isn't working.
 
 ## Validate prepared statements are captured
 
