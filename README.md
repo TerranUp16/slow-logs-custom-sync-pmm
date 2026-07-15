@@ -28,10 +28,10 @@ Full design rationale and pipeline diagram: [docs/architecture.md](docs/architec
   [docs/sslip.md](docs/sslip.md)).
 - DO Managed MySQL with slow query log enabled, and a `pmm_monitor` DB user
   created.
-- An SSH key for cloning this repo onto the sink Droplet — no other machine
-  is needed. This is a single, non-HA sink Droplet by design (see
-  [docs/architecture.md](docs/architecture.md)); everything below runs in
-  one SSH session on it.
+- SSH access to the sink Droplet itself — no other machine is needed (the
+  repo is public, so `git clone` over HTTPS needs no key). This is a single,
+  non-HA sink Droplet by design (see [docs/architecture.md](docs/architecture.md));
+  everything below runs in one SSH session on it.
 
 ## Install (Ubuntu 24.04 LTS)
 
@@ -42,7 +42,7 @@ Full design rationale and pipeline diagram: [docs/architecture.md](docs/architec
 2. **Provision the sink Droplet, SSH in, and clone this repo there**:
    ```bash
    ssh root@<SINK_IP>
-   git clone git@github.com:DO-Solutions/slow-logs-custom-sync-pmm.git
+   git clone https://github.com/DO-Solutions/slow-logs-custom-sync-pmm.git
    cd slow-logs-custom-sync-pmm
    ```
 3. **Create and fill in `.env`** — see [Configuration](#configuration-env) below.

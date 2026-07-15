@@ -94,7 +94,7 @@ SSH into the sink Droplet and clone the repo there — this is the directory
 
 ```bash
 ssh root@<SINK_IP>
-git clone git@github.com:DO-Solutions/slow-logs-custom-sync-pmm.git
+git clone https://github.com/DO-Solutions/slow-logs-custom-sync-pmm.git
 cd slow-logs-custom-sync-pmm
 ```
 
