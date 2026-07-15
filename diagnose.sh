@@ -44,10 +44,17 @@ if [ "${1:-}" = "--direct" ]; then
   MODE="direct"
 fi
 
+# Color PASS/WARN/FAIL when writing to an actual terminal (checked per stream,
+# since PASS goes to stdout but WARN/FAIL go to stderr) and NO_COLOR isn't set
+# (https://no-color.org). Falls back to plain text when piped/redirected/logged
+# so output stays clean in files or CI.
+if [ -z "${NO_COLOR:-}" ] && [ -t 1 ]; then GREEN=$'\033[32m'; RESET_OUT=$'\033[0m'; else GREEN=""; RESET_OUT=""; fi
+if [ -z "${NO_COLOR:-}" ] && [ -t 2 ]; then YELLOW=$'\033[33m'; RED=$'\033[31m'; RESET_ERR=$'\033[0m'; else YELLOW=""; RED=""; RESET_ERR=""; fi
+
 PASS=0; WARN=0; FAIL=0
-pass() { echo "  PASS: $1"; PASS=$((PASS + 1)); }
-warn() { echo "  WARN: $1" >&2; WARN=$((WARN + 1)); }
-fail() { echo "  FAIL: $1" >&2; FAIL=$((FAIL + 1)); }
+pass() { echo "  ${GREEN}PASS${RESET_OUT}: $1"; PASS=$((PASS + 1)); }
+warn() { echo "  ${YELLOW}WARN${RESET_ERR}: $1" >&2; WARN=$((WARN + 1)); }
+fail() { echo "  ${RED}FAIL${RESET_ERR}: $1" >&2; FAIL=$((FAIL + 1)); }
 section() { echo ""; echo "==> $1"; }
 
 echo "Pipeline health check — every stage runs and reports; a FAIL early on"
@@ -67,7 +74,14 @@ if [ -n "$DB_HOST" ] && [ -n "$DB_PASS" ] && [ -f "$DB_QUERY_CA" ]; then
     read -r SLOW_ON LOG_OUT LONG_TIME <<<"$DB_VARS"
     if [ "$SLOW_ON" = "1" ]; then pass "slow_query_log is ON"; else fail "slow_query_log is OFF (@@slow_query_log=$SLOW_ON) — enable it in DO Advanced Configuration"; fi
     if [ "$LOG_OUT" = "FILE" ]; then pass "log_output is FILE (DO's INSIGHTS mode — correctly forwarding via syslog)"; else fail "log_output is '$LOG_OUT', expected FILE — set log_output=INSIGHTS in DO Advanced Configuration (RUNBOOK Step 4 has a note about a toggle bug: if it's never been changed before, it may show INSIGHTS in the UI while actually still TABLE — set it to something else, save, then back to INSIGHTS, save again)"; fi
-    if [ "$LONG_TIME" = "0" ]; then pass "long_query_time is 0 (captures all queries)"; else warn "long_query_time is $LONG_TIME, not 0 — queries faster than this won't be logged as slow"; fi
+    # long_query_time is a decimal (MySQL reports it as e.g. "0.000000"), so a
+    # plain string comparison against "0" fails even when it's really zero —
+    # compare numerically instead.
+    if awk -v v="$LONG_TIME" 'BEGIN { exit !(v == 0) }' 2>/dev/null; then
+      pass "long_query_time is 0 (captures all queries)"
+    else
+      warn "long_query_time is $LONG_TIME, not 0 — queries faster than this won't be logged as slow"
+    fi
   else
     fail "could not query DB config — see the mysql_probe error above, if any (credentials/network/TLS)"
   fi
