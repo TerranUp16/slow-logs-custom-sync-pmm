@@ -126,7 +126,7 @@ PMM_TOKEN=<glsa_... token from Step 1, or leave blank to auto-mint on fresh inst
 # fine — leave this line out unless you need a non-default path). Do NOT put the
 # downloaded cert here yourself: paste it into certs/do-ca.crt instead (below) —
 # setup.sh copies it from there to this path automatically.
-DO_CA_BUNDLE=/etc/mysql_sink/do-ca.crt
+# DO_CA_BUNDLE=/etc/mysql_sink/do-ca.crt
 ```
 
 > `SINK_HOSTNAME` is the linchpin of the TLS design: rsyslog presents a Let's Encrypt
