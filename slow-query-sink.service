@@ -14,6 +14,10 @@ Restart=on-failure
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
+# 0640 for anything the daemon creates (it recreates native_slow_query.log if a
+# rotation removed it), keeping SQL text off-limits to other local users; group
+# adm comes from the setgid processed/ directory (see setup.sh).
+UMask=0027
 
 # Hardening — daemon only needs to read/write under /var/log/mysql_sink
 NoNewPrivileges=true

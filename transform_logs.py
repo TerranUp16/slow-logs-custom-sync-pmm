@@ -35,8 +35,18 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# RFC3164: <pri>Mon DD HH:MM:SS hostname tag: message
-RFC3164_HOST_RE = re.compile(r'^<\d+>\w{3}\s+\d+\s+[\d:]+\s+(\S+)\s+')
+# Source host is the field after the timestamp. DO sends RFC3164 on the wire, but
+# what we parse is rsyslog's *file* output, whose shape depends on the omfile
+# template — so accept every shape it can realistically have:
+#   RSYSLOG_FileFormat (setup.sh pins this):  2026-11-12T21:53:42+00:00 host mysqld[241]: ...
+#   RSYSLOG_TraditionalFileFormat:            Nov 12 21:53:42 host mysqld[241]: ...
+#   raw RFC3164 with PRI:                     <134>Nov 12 21:53:42 host mysqld[241]: ...
+# (An earlier version only matched the last form, which rsyslog never writes to a
+# file, so every line was keyed to host "unknown" and per-host block separation
+# silently didn't happen.)
+SYSLOG_HOST_RE = re.compile(
+    r'^(?:<\d+>)?(?:\d{4}-\d{2}-\d{2}T[\d:.]+(?:Z|[+-]\d{2}:?\d{2})|\w{3}\s+\d+\s+[\d:]+)\s+(\S+)\s+'
+)
 SEQ_RE = re.compile(r'\[(\d+)-(\d+)\]')
 
 _running = True
@@ -55,10 +65,6 @@ def _warn_drop(reason):
 def _handle_signal(signum, frame):
     global _running
     _running = False
-
-
-signal.signal(signal.SIGTERM, _handle_signal)
-signal.signal(signal.SIGINT, _handle_signal)
 
 
 def _get_inode(path):
@@ -83,7 +89,33 @@ def _open_tail(path):
     return None, None
 
 
-def _finalize_block(key, blocks, block_times, out_file):
+def _open_output(path):
+    """Open the processed log for appending; return (file, inode of what we opened).
+    The inode is remembered so run() can notice when logrotate (or anything else)
+    has moved the file out from under us — see _reopen_output_if_rotated."""
+    f = open(path, "a")
+    return f, os.fstat(f.fileno()).st_ino
+
+
+def _reopen_output_if_rotated(path, out_file, out_inode):
+    """Reopen the processed log if the file at `path` is no longer the one we
+    hold open. Without this, after logrotate renames native_slow_query.log to
+    .1 and creates a fresh empty file, we'd keep appending to .1 (and later to a
+    deleted .2.gz inode) while pmm-agent tails the new, forever-empty file —
+    i.e. QAN silently stops one day after deployment.
+
+    If the path is missing entirely (deleted, or caught between logrotate's
+    rename and create), recreate it ourselves; the unit's UMask plus the setgid
+    processed/ directory give it the same 0640 mysqlsink:adm that logrotate's
+    `create` line would."""
+    if _get_inode(path) == out_inode:
+        return out_file, out_inode
+    log.info("Output file %s was rotated or removed, reopening", path)
+    out_file.close()
+    return _open_output(path)
+
+
+def _finalize_block(key, blocks, block_times, out_file, stale=False):
     """Write out a block once we're sure no more lines are coming for it: either
     the same host started a new block (see active_block in _process_line), or it
     went stale. A block's true line count isn't known up front (it varies with
@@ -95,7 +127,10 @@ def _finalize_block(key, blocks, block_times, out_file):
         return
     max_line = max(lines)
     if len(lines) != max_line or not all(i in lines for i in range(1, max_line + 1)):
-        _warn_drop("finalized block has gaps")
+        if stale:
+            log.warning("Discarding stale incomplete block host=%s block_id=%s", *key)
+        else:
+            _warn_drop("finalized block has gaps")
         return
     rebuilt = [lines[i] for i in range(1, max_line + 1)]
     out_file.write("\n".join(rebuilt) + "\n\n")
@@ -110,7 +145,7 @@ def _process_line(line, blocks, block_times, active_block, out_file):
     if "[SlowQuery]" not in line:
         return
 
-    host_match = RFC3164_HOST_RE.match(line)
+    host_match = SYSLOG_HOST_RE.match(line)
     source_host = host_match.group(1) if host_match else "unknown"
 
     seq_match = SEQ_RE.search(line)
@@ -120,10 +155,10 @@ def _process_line(line, blocks, block_times, active_block, out_file):
     block_id = int(seq_match.group(1))
     line_num  = int(seq_match.group(2))
 
-    parts = line.split(f"[{block_id}-{line_num}]")
-    if len(parts) < 2:
-        return
-    payload = parts[1].strip()
+    # Everything after the FIRST [block-line] tag is payload. (maxsplit matters:
+    # SQL text that happens to contain the same "[12-3]" string must not be
+    # truncated at it.)
+    payload = line[seq_match.end():].strip()
     if len(payload) > MAX_PAYLOAD_BYTES:
         _warn_drop("oversized payload")
         return
@@ -150,19 +185,25 @@ def _process_line(line, blocks, block_times, active_block, out_file):
     active_block[source_host] = key
 
 
-def _purge_stale(blocks, block_times, active_block):
+def _purge_stale(blocks, block_times, active_block, out_file):
+    """Finalize blocks older than BLOCK_TTL. Normally a block is finalized when
+    its host starts the next one (see _process_line), but the LAST block before
+    a quiet period never gets that signal — so it has to be finalized here, and
+    written out if it's complete. (Discarding it instead, as this used to, lost
+    the final slow query of every burst on a quiet DB.)"""
     now   = time.monotonic()
     stale = [k for k, ts in block_times.items() if now - ts > BLOCK_TTL]
     for key in stale:
-        log.warning("Discarding stale incomplete block host=%s block_id=%s", *key)
-        del blocks[key]
-        del block_times[key]
         host = key[0]
         if active_block.get(host) == key:
             del active_block[host]
+        _finalize_block(key, blocks, block_times, out_file, stale=True)
 
 
 def run():
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+
     os.makedirs(os.path.dirname(SLOW_LOG_OUTPUT), exist_ok=True)
 
     blocks       = {}  # (host, block_id) -> {line_num: payload}
@@ -175,7 +216,8 @@ def run():
     if f is None:
         return
 
-    with open(SLOW_LOG_OUTPUT, "a") as out_file:
+    out_file, out_inode = _open_output(SLOW_LOG_OUTPUT)
+    try:
         while _running:
             line = f.readline()
 
@@ -192,11 +234,17 @@ def run():
                     f.seek(0)
                     continue
 
-                _purge_stale(blocks, block_times, active_block)
+                out_file, out_inode = _reopen_output_if_rotated(SLOW_LOG_OUTPUT, out_file, out_inode)
+                _purge_stale(blocks, block_times, active_block, out_file)
                 time.sleep(POLL_INTERVAL)
-
-    if f:
-        f.close()
+    finally:
+        # In-flight blocks are deliberately NOT flushed on stop: one that's
+        # mid-delivery can look gap-free (lines 1..k of N) and would be written
+        # truncated. Losing at most the last few seconds' worth across a restart
+        # is the safer trade.
+        out_file.close()
+        if f:
+            f.close()
     log.info("Daemon stopped")
 
 
