@@ -78,6 +78,14 @@ Copy `env.example` to `.env` and fill in:
 | `SINK_IP`, `SINK_HOSTNAME`, `LETSENCRYPT_EMAIL` | Sink Droplet's public identity — `SINK_HOSTNAME` must resolve to `SINK_IP` |
 | `PMM_SERVER`, `PMM_TOKEN` | PMM Server address + API token (leave `PMM_TOKEN` blank to auto-mint on a fresh PMM install) |
 | `DO_CA_BUNDLE` | Where `setup.sh` **installs** the DO Managed DB CA cert on this Droplet (default is fine — leave unset). This is **not** where you put the downloaded cert; paste that into `certs/do-ca.crt` instead (see below) |
+| `PMM_SERVICE_NAME`, `PMM_NODE_NAME` | Optional with one sink (defaults: `do-managed-mysql`, the Droplet's hostname). **Must be unique per sink** when several sinks report to one PMM Server |
+| `PMM_ENVIRONMENT`, `PMM_CLUSTER`, `PMM_REPLICATION_SET`, `PMM_CUSTOM_LABELS` | Optional PMM labels for grouping/comparing endpoints (e.g. primary vs replica) |
+| `LOCAL_PROXY_PORT`, `PMM_FORCE_REREGISTER` | Rarely needed: local socat port (default `DB_PORT`); `1` to replace a stale PMM node with this sink's name |
+
+**Monitoring several endpoints** (e.g. a cluster and its read-only replica) in
+one PMM Server: deploy one sink per endpoint, each with its own `.env`, token,
+`PMM_SERVICE_NAME` and node name — no source edits. See
+[RUNBOOK.md, "Monitoring multiple Managed MySQL endpoints with one PMM Server"](RUNBOOK.md#monitoring-multiple-managed-mysql-endpoints-with-one-pmm-server).
 
 Separately, paste the DO Managed DB's CA certificate (Connection Details →
 Download CA certificate in the DO control panel) into `certs/do-ca.crt` in

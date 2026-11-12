@@ -82,9 +82,17 @@ are flowing; on a quiet DB the final query of a burst can take up to ~30 s to
 appear. Any further lag you see in QAN is PMM's own ingestion interval, not
 this daemon.
 
-## Deployment model: single sink Droplet, no HA
+## Deployment model: one sink Droplet per endpoint, no HA
 
-The sink Droplet is intentionally a single, non-clustered resource — no
+"Single sink" means **one sink per DB endpoint**. Each endpoint DO lets you
+point Log Forwarding at — a cluster's primary, or a read-only replica — gets
+its own sink Droplet, with its own `.env`, mTLS CA, PMM token, PMM node and
+PMM service. Any number of sinks can report to one PMM Server; they only need
+unique `PMM_SERVICE_NAME` and node names (`setup.sh` refuses to register over
+another machine's node or service). See RUNBOOK "Monitoring multiple Managed
+MySQL endpoints with one PMM Server".
+
+Each sink is intentionally a single, non-clustered resource — no
 horizontal scaling, no standby, no automatic failover. If it goes down, log
 forwarding to QAN stops until it's back, and that downtime is an accepted
 trade-off, not an oversight: for the customer this repo was first built for,
@@ -121,7 +129,7 @@ config toggle on top of what's here today.
 | DO log forwarder | DO-managed | Streams syslog over mutual TLS to the sink |
 | `rsyslog` (mTLS listener, port 6514) | Sink Droplet | Receives + authenticates the forwarded stream |
 | `slow-query-sink.service` (`transform_logs.py`) | Sink Droplet | Reconstructs syslog lines into a real slow-log file |
-| `socat-mysql-proxy.service` | Sink Droplet | TCP proxy `127.0.0.1:<port>` → the real DB host, so PMM/`mysql_slowlog_agent` connects "locally" |
+| `socat-mysql-proxy.service` | Sink Droplet | TCP proxy `127.0.0.1:<LOCAL_PROXY_PORT>` → the real DB host, so PMM/`mysql_slowlog_agent` connects "locally" |
 | `pmm-agent` + `mysql_slowlog_agent` | Sink Droplet | Registers with PMM Server, tails the symlinked log |
 | PMM Server | Separate Droplet | Ingests, aggregates, and displays QAN data |
 
