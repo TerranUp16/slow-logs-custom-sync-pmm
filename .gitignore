@@ -9,3 +9,6 @@ certs/
 # bytecode from running tests/.
 .venv/
 __pycache__/
+
+# macOS Finder metadata
+.DS_Store
