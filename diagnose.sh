@@ -73,14 +73,15 @@ if [ -n "$DB_HOST" ] && [ -n "$DB_PASS" ] && [ -f "$DB_QUERY_CA" ]; then
   if [ -n "$DB_VARS" ]; then
     read -r SLOW_ON LOG_OUT LONG_TIME <<<"$DB_VARS"
     if [ "$SLOW_ON" = "1" ]; then pass "slow_query_log is ON"; else fail "slow_query_log is OFF (@@slow_query_log=$SLOW_ON) — enable it in DO Advanced Configuration"; fi
-    if [ "$LOG_OUT" = "FILE" ]; then pass "log_output is FILE (DO's INSIGHTS mode — correctly forwarding via syslog)"; else fail "log_output is '$LOG_OUT', expected FILE — set log_output=INSIGHTS in DO Advanced Configuration (RUNBOOK Step 4 has a note about a toggle bug: if it's never been changed before, it may show INSIGHTS in the UI while actually still TABLE — set it to something else, save, then back to INSIGHTS, save again)"; fi
-    # long_query_time is a decimal (MySQL reports it as e.g. "0.000000"), so a
-    # plain string comparison against "0" fails even when it's really zero —
-    # compare numerically instead.
-    if awk -v v="$LONG_TIME" 'BEGIN { exit !(v == 0) }' 2>/dev/null; then
-      pass "long_query_time is 0 (captures all queries)"
+    if [ "$LOG_OUT" = "FILE" ]; then pass "log_output is FILE (DO's LOGS mode, formerly called INSIGHTS — correctly forwarding via syslog)"; else fail "log_output is '$LOG_OUT', expected FILE — set log_output=LOGS (older UI/docs: INSIGHTS) in DO Advanced Configuration (RUNBOOK Step 4 has a note about a toggle bug: on a cluster where it's never been changed, DO can report LOGS while MySQL is actually still on TABLE — set it to TABLE, save, then back to LOGS, save again)"; fi
+    # long_query_time is a decimal (MySQL reports e.g. "0.100000"), so compare
+    # numerically, not as strings. DO's API currently rejects anything below
+    # 0.1, so 0.1 is the recommended (and lowest settable) value — see RUNBOOK
+    # Step 4 for what that threshold means for QAN coverage.
+    if awk -v v="$LONG_TIME" 'BEGIN { exit !(v <= 0.1) }' 2>/dev/null; then
+      pass "long_query_time is $LONG_TIME (captures every statement taking >= this many seconds; faster ones never reach the slow log or QAN)"
     else
-      warn "long_query_time is $LONG_TIME, not 0 — queries faster than this won't be logged as slow"
+      warn "long_query_time is $LONG_TIME — statements faster than that never reach the slow log or QAN. Set it to 0.1 (the lowest value DO accepts) unless you deliberately want a higher threshold"
     fi
   else
     fail "could not query DB config — see the mysql_probe error above, if any (credentials/network/TLS)"
@@ -185,6 +186,21 @@ if systemctl is-active --quiet slow-query-sink 2>/dev/null; then
   echo "  incoming file, this daemon is parked waiting for it to appear, which is expected"
   echo "  behavior, not a crash. Last 5 log lines:"
   journalctl -u slow-query-sink -n 5 --no-pager 2>/dev/null | sed 's/^/    /'
+  # Is the daemon writing to the file pmm-agent actually reads? Older versions
+  # of transform_logs.py never reopened their output, so after the first
+  # logrotate they kept appending to native_slow_query.log.1 while the real
+  # path stayed empty.
+  DAEMON_PID="$(systemctl show -p MainPID --value slow-query-sink 2>/dev/null)"
+  if [ -n "$DAEMON_PID" ] && [ "$DAEMON_PID" != "0" ] && [ -e "$PROCESSED_FILE" ]; then
+    WRITING_TO="$(for fd in /proc/"$DAEMON_PID"/fd/*; do readlink "$fd"; done 2>/dev/null | grep '/processed/' | head -1)"
+    if [ -z "$WRITING_TO" ]; then
+      echo "  (daemon has no processed-log file open yet — expected until the first data arrives)"
+    elif [ "$WRITING_TO" = "$PROCESSED_FILE" ]; then
+      pass "daemon is writing to $PROCESSED_FILE"
+    else
+      fail "daemon is writing to '$WRITING_TO', not $PROCESSED_FILE — it missed a log rotation (pre-fix transform_logs.py), so QAN sees no new data. Fix: git pull && bash setup.sh (or at least: systemctl restart slow-query-sink)"
+    fi
+  fi
 else
   fail "slow-query-sink.service is NOT active — systemctl status slow-query-sink ; journalctl -u slow-query-sink -n 50"
 fi
@@ -192,7 +208,9 @@ fi
 # --- 9: symlink, target file, and PMM agent status ---------------------------
 section "9/9 Symlink, target file, and PMM agent status"
 VERIFY_LOG="$(mktemp)"
-if bash "$SCRIPT_DIR_LOCAL/verify-slow-log.sh" $([ "$MODE" = "direct" ] && echo --direct) >"$VERIFY_LOG" 2>&1; then
+VERIFY_ARGS=()
+[ "$MODE" = "direct" ] && VERIFY_ARGS+=(--direct)
+if bash "$SCRIPT_DIR_LOCAL/verify-slow-log.sh" "${VERIFY_ARGS[@]}" >"$VERIFY_LOG" 2>&1; then
   pass "verify-slow-log.sh reports the symlink and target file are both correct"
 else
   fail "verify-slow-log.sh reports a problem:"
@@ -204,7 +222,13 @@ if command -v pmm-admin >/dev/null 2>&1; then
   AGENT_LINE="$(pmm-admin list 2>/dev/null | grep mysql_slowlog_agent || true)"
   if [ -n "$AGENT_LINE" ]; then
     echo "  $AGENT_LINE"
-    if echo "$AGENT_LINE" | grep -q 'Running'; then
+    # "Running" is necessary but not sufficient: if the path it tails vanishes
+    # (e.g. PMM's own rotation renamed our symlink), the agent stays "Running"
+    # while logging "Failed to stat" every second and sending nothing.
+    STAT_ERRORS="$(journalctl -u pmm-agent --since '5 min ago' --no-pager 2>/dev/null | grep -c 'Failed to stat' || true)"
+    if [ "${STAT_ERRORS:-0}" -gt 0 ]; then
+      fail "mysql_slowlog_agent reports Running, but pmm-agent logged $STAT_ERRORS 'Failed to stat' error(s) in the last 5 min — the slow-log path it tails is missing (see verify-slow-log.sh output above). Fix: git pull && bash setup.sh"
+    elif echo "$AGENT_LINE" | grep -q 'Running'; then
       pass "mysql_slowlog_agent is Running"
     else
       warn "mysql_slowlog_agent is not Running yet — it commonly shows 'Waiting' until $PROCESSED_FILE exists and has content, which will resolve once stages 7-8 above are fixed"
