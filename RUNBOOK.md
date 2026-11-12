@@ -28,8 +28,8 @@ QAN ingestion has a separate polling interval — see Step 6 and Troubleshooting
 
 | What | Notes |
 |------|-------|
-| **PMM Server Droplet** | **Ubuntu 22.04 LTS or 24.04 LTS** — see "Supported OS versions" below. Minimum 4 GB RAM (8 GB recommended). Must be provisioned and reachable before running `setup.sh`. Note DigitalOcean offers [a prebuilt Marketplace Droplet to make this deployment easier](https://marketplace.digitalocean.com/apps/percona-monitoring-and-management) |
-| **Sink Droplet** | **Ubuntu 22.04 LTS or 24.04 LTS** — see "Supported OS versions" below. Any size (required size based on database query load; can upscale the Droplet later if initial size guess is too small or weak). This is where `setup.sh` runs. |
+| **PMM Server Droplet** | **Ubuntu 22.04, 24.04 or 26.04 LTS** — see "Supported OS versions" below. Minimum 4 GB RAM (8 GB recommended). Must be provisioned and reachable before running `setup.sh`. Note DigitalOcean offers [a prebuilt Marketplace Droplet to make this deployment easier](https://marketplace.digitalocean.com/apps/percona-monitoring-and-management) |
+| **Sink Droplet** | **Ubuntu 22.04, 24.04 or 26.04 LTS** — see "Supported OS versions" below. Any size (required size based on database query load; can upscale the Droplet later if initial size guess is too small or weak). This is where `setup.sh` runs. |
 | **DNS hostname for the sink** | A public DNS **A record** pointing at the sink Droplet's IP (e.g. `logs.example.com → <SINK_IP>`). Required — the sink presents a Let's Encrypt cert for this name, and certbot's HTTP-01 challenge needs it to resolve here. No domain handy? `<IP-dashed>.sslip.io` works for testing. |
 | **DO Managed MySQL** | Slow query log must be enabled in the DO control panel (Database → Settings → Slow query log). |
 | **`pmm_monitor` DB user** | Create via DO control panel (Database → Users). DO grants appropriate access by default — no additional `GRANT` statements needed. |
@@ -37,15 +37,19 @@ QAN ingestion has a separate polling interval — see Step 6 and Troubleshooting
 
 ### Supported OS versions
 
-**Ubuntu 22.04 LTS and 24.04 LTS only.** Ubuntu 26.04 LTS is **not supported** —
-as of this writing, Percona has not released (or tested) `percona-release`/
-`pmm-client` packages for it. Getting `pmm-client` installed on 26.04 requires
-manually rewriting `apt` package-source distro codenames to point at an
-older release's repo. That happens to work, but it's unverified by Percona
-and can silently break on any Percona-side update — don't do this for a real
-deployment. `setup.sh` prints a warning (not a hard stop) if it detects an
-unsupported OS version, so existing test boxes aren't locked out, but treat
-anything other than 22.04/24.04 as unsupported.
+**Ubuntu 22.04 LTS, 24.04 LTS and 26.04 LTS.** These are the Ubuntu releases
+Percona's `pmm3-client` apt repository publishes `pmm-client` for (`jammy`,
+`noble`, `resolute`) — `setup.sh` installs it from there via `percona-release`
+with no manual repo edits. The full pipeline has been validated end to end on
+24.04 and 26.04 (pmm-client 3.10.0, November 2026). Percona's own docs only
+say "Ubuntu Server LTS" without listing versions, so if a future Ubuntu
+release appears, check for its codename under
+`https://repo.percona.com/pmm3-client/apt/dists/` before using it.
+
+`setup.sh` prints a warning (not a hard stop) on any other version, so
+existing test boxes aren't locked out — but don't deploy a real integration
+on one: getting `pmm-client` onto it means pointing `apt` at another release's
+repo, which is unverified and can break silently on any Percona-side update.
 
 ---
 
@@ -161,10 +165,34 @@ In the DO control panel, go to [**Databases → your cluster → Settings → Ad
 | Setting | Value | Notes |
 |---------|-------|-------|
 | `slow_query_log` | `on` | Enables slow query logging |
-| `log_output` | `INSIGHTS` | **Required** — DO's abstraction for `FILE`; if set to `TABLE`, slow queries are not forwarded via syslog. NOTE- due to a bug, if this has never been changed on the cluster yet, this will show as `INSIGHTS`, but it is actually set to `TABLE`. Set this to any other value, save the change, and then change this to `INSIGHTS` and save the configuration change to properly apply `INSIGHTS` setting. Note you can verify if this is set correctly by checking `SELECT @@log_output;` on your MySQL command-line- you want to see `FILE` instead of `TABLE` from this command's output |
-| `long_query_time` | `0` | Captures all queries |
+| `log_output` | `LOGS` | **Required** — DO's abstraction for MySQL's `FILE`; with `TABLE`, slow queries are not forwarded via syslog. DO renamed this value: it used to be `INSIGHTS`, and the API now rejects `INSIGHTS` — if your control panel still shows `INSIGHTS`, it's the same setting. **Toggle bug:** on a cluster where this has never been changed, DO can report `LOGS` while MySQL is actually still on `TABLE` (reproduced November 2026 on a brand-new cluster). Set it to `TABLE`, save, then back to `LOGS`, save again. Verify with `SELECT @@log_output;` — you want `FILE`, not `TABLE` |
+| `long_query_time` | `0.1` | The lowest value DO accepts — see below. (Earlier versions of this runbook said `0`; DO's API now rejects anything below `0.1` with an HTTP 500, even though its published API spec allows `0`.) |
 
-Save and wait ~30 seconds for the settings to apply.
+Save and wait ~30 seconds for the settings to apply. `bash diagnose.sh`
+(Step 6) checks all three on the live DB.
+
+> **What `long_query_time = 0.1` means for what you'll see in QAN.** MySQL
+> writes a statement to the slow log only if it takes at least
+> `long_query_time` seconds to execute, and the slow log is this pipeline's
+> only data source for QAN. So, for the PMM service this pipeline registers:
+>
+> - **Only statements taking ≥ 100 ms appear in QAN.** That applies to
+>   prepared statements too: a prepared statement that runs in 5 ms is just
+>   as invisible as a 5 ms plain query. This pipeline answers "which
+>   prepared (and other) statements are slow?", not "what is my whole
+>   workload doing?".
+> - **QAN's counts, load and "% of total time" describe the slow subset only.**
+>   A query that runs thousands of times a second at 2 ms each — often the
+>   largest share of real load — won't show up at all, so rankings are biased
+>   toward slow outliers. Don't read QAN here as a complete workload profile.
+> - **Server-level metrics are unaffected.** The MySQL dashboards fed by
+>   `mysqld_exporter` (QPS, connections, InnoDB, etc.) still cover all traffic;
+>   only per-query QAN detail is thresholded.
+> - **Lower is not available, higher is a valid choice.** Every logged
+>   statement flows through DO's log forwarder, the sink and PMM, so a higher
+>   threshold (e.g. `0.5` or `1`) cuts that volume on a very busy database,
+>   at the cost of even less coverage. `diagnose.sh` warns about anything
+>   above `0.1` so a higher value is a deliberate choice, not an accident.
 
 ### Generate mTLS certificates (before configuring forwarding)
 
@@ -266,7 +294,18 @@ bash setup.sh
 7. Queries the DB for its `slow_query_log_file` path and symlinks it to the processed log.
 8. Registers the MySQL service in PMM with `--query-source=slowlog`, and verifies it actually appears in `pmm-admin list`.
 
-It's idempotent — safe to re-run after fixing a config issue.
+It's idempotent — safe to re-run after fixing a config issue, and after a
+`git pull` to pick up fixes: a re-run restarts `slow-query-sink` and the
+`socat` proxy so they run the new code/config. Each run also re-registers this
+Droplet's node with PMM (`pmm-admin config --force`), which removes and
+re-creates the MySQL service under the same name — QAN history stays
+available under the service name, but the PMM service/agent IDs change.
+
+It also disables PMM's own built-in slow-log rotation for the service and
+leaves rotation to the sink's logrotate config. PMM's rotation renames
+`slow_query_log_file` and expects `mysqld` to recreate it, which can't happen
+here — it would rename our symlink away and silently stop QAN (see
+Troubleshooting).
 
 ---
 
@@ -332,16 +371,30 @@ bash verify-slow-log.sh --direct     # bypass the proxy — isolates "is it the 
 is what actually exercises the reason this whole pipeline exists: prepared
 statements, which `performance_schema` QAN cannot see, but slow-log QAN can):
 ```bash
-pip3 install mysql-connector-python --break-system-packages
-set -a; source .env; set +a          # exposes DB_PASS from .env into this shell
-python3 test_prepared_statements.py "${DB_PASS}"
+apt-get install -y python3-venv
+python3 -m venv .venv                          # in the repo dir; .venv/ is gitignored
+.venv/bin/pip install mysql-connector-python   # current connector from PyPI
+set -a; source .env; set +a                    # exposes DB_PASS from .env into this shell
+.venv/bin/python test_prepared_statements.py "${DB_PASS}"
 ```
-(The script also accepts `DB_PASS=... python3 test_prepared_statements.py` with no
-positional arg. Either way, a password is required — running it with neither just
-prints its `Usage:` message and exits.)
+(The script also accepts `DB_PASS=... .venv/bin/python test_prepared_statements.py`
+with no positional arg. Either way, a password is required — running it with
+neither just prints its `Usage:` message and exits.)
+
+> **Use the venv, not Ubuntu's `python3-mysql.connector` package.** On Ubuntu
+> 24.04 the apt package is connector 8.0.15, which calls `ssl.wrap_socket()` —
+> removed in the Python 3.12 that 24.04 ships — so it fails on connect with
+> `AttributeError: module 'ssl' has no attribute 'wrap_socket'` (the script
+> detects this and prints these instructions). On 26.04 the apt package is
+> 9.5.0 and works, but the venv route above works on every supported release
+> and doesn't touch system packages, so it's the one to use. (Older versions of
+> this runbook used `pip3 install --break-system-packages`; that also works,
+> but mixes a PyPI package into the system Python.)
 
 > **QAN can lag behind the slow log by a minute or so.** The sink daemon
-> (`transform_logs.py`) writes to `native_slow_query.log` immediately, but PMM's
+> (`transform_logs.py`) writes to `native_slow_query.log` as soon as each entry
+> is complete (for the very last query before the DB goes quiet, that's up to
+> ~30 s, since nothing else signals that its entry is finished), but PMM's
 > own QAN ingestion/aggregation pipeline has its own polling interval on top of
 > that. If `grep` finds your test query in `native_slow_query.log` but QAN hasn't
 > shown it yet, wait a bit before assuming something's broken.
@@ -357,7 +410,7 @@ When the managed DB cluster is replaced (new hostname or password):
 3. On the sink Droplet, update `.env` with the new `DB_HOST` and `DB_PASS`.
 4. On the sink Droplet: `bash setup.sh`.
 
-The script is idempotent — it updates the socat service target, recreates the symlink, and re-registers PMM (using `--force` if the node name already exists).
+The script is idempotent — it re-points and restarts the socat proxy at the new `DB_HOST`, recreates the symlink (the new cluster reports a different `slow_query_log_file` path), and re-registers this node and its MySQL service in PMM (`pmm-admin config --force`).
 
 ---
 
@@ -370,7 +423,7 @@ re-pointing DO at it. Because `gen-certs.sh` runs per-Droplet, the new
 Droplet mints its **own new CA and client cert** — DO's Log Forwarding panel
 needs updating, it isn't a no-op this time:
 
-1. Provision a new Ubuntu droplet (22.04 LTS or 24.04 LTS).
+1. Provision a new Ubuntu droplet (22.04, 24.04 or 26.04 LTS).
 2. On the new Droplet: clone the repo (Step 2), create and fill in `.env`
    (Step 3) — using the same `DB_HOST`/`DB_PASS`, and the new Droplet's own
    `SINK_IP` — and repoint `SINK_HOSTNAME`'s DNS A record at the new droplet's
@@ -436,20 +489,26 @@ applies, rather than you needing to guess from the symptom alone.
 | Symptom | Check |
 |---------|-------|
 | `combined_mysql.log` doesn't exist at all, or exists but isn't growing | No data has ever arrived from DO (or hasn't recently). Check, in order: rsyslog is actually running — `systemctl status rsyslog`; it's listening — `ss -tlnp \| grep 6514`; firewall — `ufw status` (allow 6514/tcp); TLS handshake/cert errors, or a total absence of connection attempts — `journalctl -u rsyslog -n 100` (cert mismatch, expired, or wrong CA in DO panel; no attempts at all usually means DO's Log Forwarding config wasn't actually saved correctly); confirm DO's Log Forwarding destination has TLS enabled AND that **Show advanced configuration options** was expanded with Client key/Client certificate actually pasted in — it's collapsed by default and easy to miss (see Step 4) |
-| `combined_mysql.log` has data but no `[SlowQuery]` lines | `log_output` is not set to `INSIGHTS` — change in DO advanced config (DO's abstraction for `FILE`; `TABLE` does not forward via syslog) |
+| `combined_mysql.log` has data but no `[SlowQuery]` lines | `log_output` is not set to `LOGS` (formerly `INSIGHTS`) — change in DO advanced config (DO's abstraction for `FILE`; `TABLE` does not forward via syslog). Check `SELECT @@log_output;` returns `FILE`, and see the toggle-bug note in Step 4 |
+| Setting `long_query_time` to `0` (or anything below `0.1`) fails — HTTP 500 / "Server Error" from the DO API or control panel | Expected: DO currently rejects values below `0.1`. Use `0.1` — see Step 4 for what that threshold means for QAN |
+| A query you ran doesn't show up in `native_slow_query.log` or QAN at all (not just late) | Did it take at least `long_query_time` (normally 0.1 s) to execute? Faster statements are never written to the slow log — see Step 4. `test_prepared_statements.py` uses `SLEEP()` to stay well above the threshold |
 | `native_slow_query.log` doesn't exist, even though `slow-query-sink.service` shows `active (running)` | **Expected, not a bug**, if `combined_mysql.log` doesn't exist yet: `transform_logs.py` blocks waiting to open `combined_mysql.log` before it ever creates/opens `native_slow_query.log`, and that blocking wait is not a crash — systemd will show the service as `active (running)` the whole time. Don't chase the daemon here; fix why `combined_mysql.log` is missing (row above), and this resolves itself. `bash verify-slow-log.sh` checks for exactly this and will say so explicitly rather than giving a false "OK" |
 | `native_slow_query.log` empty after daemon runs (but `combined_mysql.log` is growing) | Check `combined_mysql.log` for `[SlowQuery]` lines — slow query log may not be enabled in DO settings |
 | Daemon not running | `systemctl status slow-query-sink` and `journalctl -u slow-query-sink -n 50` |
-| "Discarding stale incomplete block" in daemon logs | A multi-line slow query block arrived with missing lines — likely a transient rsyslog drop; normal at low frequency |
+| "Discarding stale incomplete block" in daemon logs | A multi-line slow query block arrived with missing lines — likely a transient rsyslog drop; normal at low frequency. (Older versions of `transform_logs.py` also logged this for the last, *complete* query before every quiet period — and dropped it — and logged every host as `host=unknown`. If you see `host=unknown`, you're on old code: `git pull && bash setup.sh`.) |
+| QAN worked for about a day, then stopped; `native_slow_query.log` is empty or tiny while `native_slow_query.log.1` keeps growing | Old `transform_logs.py`: it never reopened its output after logrotate's daily rotation, so it kept writing to the rotated file while PMM read the new, empty one. `diagnose.sh` stage 8 reports "daemon is writing to '…log.1'". Fix: `git pull && bash setup.sh` (it restarts the daemon on the new code) |
+| QAN stopped; the `slow_query_log_file` symlink is gone but `<that path>.old` exists; `journalctl -u pmm-agent` repeats `Failed to stat … no such file or directory` while `pmm-admin list` still shows `mysql_slowlog_agent Running` | PMM's own slow-log rotation fired (default limit 1 GiB): it renames the slow-log path to `.old` and expects `mysqld` to recreate it, which can't happen here. Fix: `git pull && bash setup.sh` — it recreates the symlink, removes the stale `.old`, and sets the service's PMM-side rotation limit to 0 (disabled). `diagnose.sh` and `verify-slow-log.sh` both detect this state |
+| `./gen-certs.sh: Permission denied` | Your clone predates the scripts being marked executable in git. Run `bash gen-certs.sh` (or `git pull`) |
+| `test_prepared_statements.py` fails with `AttributeError: module 'ssl' has no attribute 'wrap_socket'` | You're using Ubuntu 24.04's apt `python3-mysql.connector` (8.0.15), which doesn't work on Python 3.12. Use the venv from Step 6 instead |
 | `mysql_probe`/`setup.sh` preflight fails with `ERROR 1045 Access denied` | Networking is fine (you got a real MySQL auth response, not a timeout) — this is a credentials issue. Check `DB_PASS` in `.env` matches the current `pmm_monitor` password exactly; if `.env` was ever edited on Windows, check for a stray trailing `\r` (`cat -A .env \| grep DB_PASS` — a `^M` before the line end means CRLF snuck in and is silently corrupting the password when bash sources it: fix with `sed -i 's/\r$//' .env`). Also confirm `pmm_monitor` actually exists on *this* DB cluster, not a previous one. |
 | PMM agents not Running | `journalctl -u pmm-agent -n 50`; verify `PMM_TOKEN` is valid; check PMM server is reachable on port 443 |
 | QAN shows no data | First check whether it's just lagging: `grep` the query text in `/var/log/mysql_sink/processed/native_slow_query.log` — if it's there, QAN's own ingestion has a polling delay on top of the sink's real-time write, give it a minute or two. If it's genuinely absent: run `bash verify-slow-log.sh` — it checks both the symlink path AND that the target file actually exists (`readlink -f` alone will resolve a path even if nothing exists there, which reads as "correct" when it isn't); confirm `mysql_slowlog_agent` is Running in `pmm-admin list` |
 | `socat-mysql-proxy` fails to start | Check `DB_HOST` and `DB_PORT` in `/etc/systemd/system/socat-mysql-proxy.service`; test connectivity: `nc -zv <DB_HOST> 25060` |
 | `setup.sh`'s DB preflight/probe fails outright (no connection), or `verify-slow-log.sh` errors | Read the printed checklist (from `mysql_probe` in `common.sh`) — most common cause is the sink Droplet not being in the DB cluster's **Trusted Sources** (Databases → cluster → Settings → Trusted Sources); DO drops the connection with no error visible on this end. Also check the socat proxy (`systemctl status socat-mysql-proxy`), credentials in `.env`, and that the CA cert matches this exact cluster. `bash verify-slow-log.sh --direct` bypasses the proxy to isolate proxy vs. DB/firewall |
 | `mysql: command not found` (from `common.sh`'s `mysql_probe`, right at the start of `setup.sh`) | Expected to self-heal: `mysql_probe` auto-installs `default-mysql-client` via `apt-get` the first time it's needed, since a fresh Droplet doesn't ship a MySQL client and the preflight check runs before `setup.sh`'s own package-install step. If you still see this, either you're on an old copy of `common.sh` (`git pull` and re-run), you're not running as root (apt-get install needs root), or the Droplet has no working internet/apt access — install it yourself with `apt-get install -y default-mysql-client` and re-run |
-| `pmm-admin config` returns "node already exists" | `setup.sh` uses `--force` by default, so re-running the script handles this automatically |
+| `pmm-admin config` returns "node already exists" | `setup.sh` uses `--force` by default, so re-running the script handles this automatically. Note `--force` removes the existing node *with that name* along with all its services and agents — so two sink Droplets with the same hostname registered to one PMM Server will remove each other's registration |
 | Node + agents exist in PMM but no service | `setup.sh` registers the service last; if it exited earlier (e.g. the DB preflight/probe failed), the node/agents from `pmm-admin config` are left orphaned. Fix the earlier failure and re-run `setup.sh` — it's idempotent and will pick up from where it left off. To fully reset first, use `destruct.sh` above |
-| rsyslog silent failure (action suspended/resumed loop) | `/var/log/mysql_sink` ownership must be `syslog:adm` mode `775` — root ownership breaks rsyslog writes |
+| rsyslog silent failure (action suspended/resumed loop) | `/var/log/mysql_sink` and `/var/log/mysql_sink/incoming` must be owned `syslog:adm` (mode `750`, as `setup.sh` sets them) — root ownership breaks rsyslog writes. Re-run `setup.sh` to restore ownership |
 
 ---
 
@@ -477,4 +536,4 @@ applies, rather than you needing to guess from the symptom alone.
 | `/etc/mysql_sink/do-ca.crt` | DO Managed DB CA cert, used for `VERIFY_CA` on the credential probe |
 | `/etc/systemd/system/slow-query-sink.service` | Systemd unit for the parser daemon |
 | `/etc/systemd/system/socat-mysql-proxy.service` | TCP proxy: `127.0.0.1:25060` → DO managed DB |
-| `/etc/logrotate.d/mysql-sink` | Rotation for both incoming (3-day) and processed (14-day) logs |
+| `/etc/logrotate.d/mysql-sink` | Rotation for both incoming (3-day) and processed (14-day) logs. The only thing that rotates these — PMM's own slow-log rotation is disabled by `setup.sh`, and `transform_logs.py` reopens its output after each rotation |

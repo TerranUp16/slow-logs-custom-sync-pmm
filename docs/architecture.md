@@ -45,19 +45,42 @@ difference.
 
 This is also why `setup.sh` re-resolves and re-creates the symlink on every
 run: if the DB reports a different path (new cluster, DB replacement), the
-symlink needs to move with it.
+symlink needs to move with it. On DO the reported path embeds the serving
+node's hostname (e.g. `/var/lib/mysql/8/data/<cluster>-1-slow.log`), so it is
+node-specific.
+
+### Who rotates the log: logrotate, not PMM
+
+The same "PMM thinks it's talking to a local mysqld" trick has one sharp edge.
+PMM's slowlog agent has its own rotation: once the file passes a size limit
+(1 GiB by default) it renames `slow_query_log_file` to `<path>.old` and runs
+`FLUSH SLOW LOGS` on the DB, expecting mysqld to recreate the file. Here the
+path is our symlink and mysqld is remote, so the rename moves the symlink
+away, nothing recreates it, and QAN silently stops (the agent keeps reporting
+`Running`). So `setup.sh` sets the service's PMM-side limit to 0 (disabled),
+and rotation belongs to `/etc/logrotate.d/mysql-sink` alone. `transform_logs.py`
+notices when logrotate has moved its output file and reopens the path, so it
+always writes to the file PMM is reading.
 
 ## Why a daemon instead of a per-minute batch job
 
 `transform_logs.py` runs as a persistent systemd service
 (`slow-query-sink.service`), continuously tailing the incoming syslog file.
 It reconstructs multi-line slow-query blocks keyed by `(source_host,
-block_id)` — necessary because the 2-node DB cluster's syslog lines
-interleave, and a naive line-by-line parser would corrupt entries by mixing
-lines from different queries or different cluster nodes. Complete entries
-are written to the processed log as soon as they're assembled, so there's no
-batching delay on the sink's side of the pipeline — any remaining lag you see
-in QAN is PMM's own ingestion interval, not this daemon.
+block_id)` — necessary because every node of the DB cluster forwards its logs
+(a standby forwards too, though only the node serving queries writes slow-log
+lines), their syslog lines can interleave, and a naive line-by-line parser
+would corrupt entries by mixing lines from different queries or different
+nodes. `source_host` is parsed from rsyslog's file output, whose format
+`setup.sh` pins (`RSYSLOG_FileFormat`) so it doesn't depend on distro
+defaults.
+
+A block is written to the processed log once it's known to be finished: when
+the same host starts its next block, or — for the last block before a quiet
+period — once it's 30 seconds old. So there's no batching delay while queries
+are flowing; on a quiet DB the final query of a burst can take up to ~30 s to
+appear. Any further lag you see in QAN is PMM's own ingestion interval, not
+this daemon.
 
 ## Deployment model: single sink Droplet, no HA
 
