@@ -56,23 +56,143 @@ ensure_mysql_client() {
   return 0
 }
 
-# pmm_slowlog_agent_id SERVICE_NAME
+# --- configuration --------------------------------------------------------------
+
+# load_config SCRIPT_DIR
 #
-# Prints the agent ID of the QAN MySQL slowlog agent attached to the PMM
-# service named exactly SERVICE_NAME (matched on the service-name field of
-# `pmm-admin --json list`, not by substring), or nothing if there isn't one.
+# Sources SCRIPT_DIR/.env (if present) and fills in every optional setting with
+# its default, so all scripts agree on defaults. Required settings are checked
+# by each script itself (setup.sh needs more than diagnose.sh does).
+#
+# Every new key defaults to what a pre-multi-instance sink already used, so an
+# old-style .env keeps producing exactly the same service name, node name,
+# ports, paths and units.
+# shellcheck disable=SC2034  # everything set here is read by the sourcing script
+load_config() {
+  local dir="$1"
+  if [ -f "$dir/.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$dir/.env"
+    set +a
+  fi
+  DB_HOST="${DB_HOST:-}"
+  DB_PORT="${DB_PORT:-25060}"
+  DB_PASS="${DB_PASS:-}"
+  PMM_MONITOR_USER="${PMM_MONITOR_USER:-pmm_monitor}"
+  # Local side of the socat proxy (what pmm-agent and every probe connect to on
+  # 127.0.0.1). Defaults to DB_PORT, which is what it always was.
+  LOCAL_PROXY_PORT="${LOCAL_PROXY_PORT:-$DB_PORT}"
+  # PMM identity. PMM_SERVICE_NAME_DEFAULTED lets callers print a one-line notice.
+  PMM_SERVICE_NAME_DEFAULTED=0
+  if [ -z "${PMM_SERVICE_NAME:-}" ]; then
+    PMM_SERVICE_NAME="do-managed-mysql"
+    PMM_SERVICE_NAME_DEFAULTED=1
+  fi
+  # PMM_NODE_NAME_SET distinguishes "explicitly configured" from the default:
+  # only an explicit name is passed to `pmm-admin config`, so an old-style .env
+  # produces byte-for-byte the same registration call as before. The default is
+  # `hostname` (the full one) because that is exactly what pmm-admin itself
+  # uses when given no node name — not `hostname -s`, which differs on hosts
+  # with an FQDN hostname and would rename existing nodes.
+  PMM_NODE_NAME_SET=0
+  if [ -n "${PMM_NODE_NAME:-}" ]; then
+    PMM_NODE_NAME_SET=1
+  else
+    PMM_NODE_NAME="$(hostname)"
+  fi
+  PMM_FORCE_REREGISTER="${PMM_FORCE_REREGISTER:-0}"
+  PMM_ENVIRONMENT="${PMM_ENVIRONMENT:-}"
+  PMM_CLUSTER="${PMM_CLUSTER:-}"
+  PMM_REPLICATION_SET="${PMM_REPLICATION_SET:-}"
+  PMM_CUSTOM_LABELS="${PMM_CUSTOM_LABELS:-}"
+}
+
+# validate_config — fail with a clear message on values that would be unsafe
+# to put into a pmm-admin command line or a systemd unit. Returns 1 (after
+# printing every problem, not just the first) if anything is invalid.
+validate_config() {
+  local bad=0 v
+  _name_ok() { [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]; }
+  for v in PMM_SERVICE_NAME PMM_NODE_NAME; do
+    if ! _name_ok "${!v}"; then
+      echo "ERROR: $v='${!v}' — only letters, digits, '.', '_' and '-' are allowed." >&2; bad=1
+    fi
+  done
+  for v in PMM_ENVIRONMENT PMM_CLUSTER PMM_REPLICATION_SET; do
+    if [ -n "${!v}" ] && ! _name_ok "${!v}"; then
+      echo "ERROR: $v='${!v}' — only letters, digits, '.', '_' and '-' are allowed." >&2; bad=1
+    fi
+  done
+  # k=v,k=v with Prometheus-style keys (PMM labels end up as metric labels).
+  if [ -n "$PMM_CUSTOM_LABELS" ] && ! [[ "$PMM_CUSTOM_LABELS" =~ ^[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9._-]+(,[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9._-]+)*$ ]]; then
+    echo "ERROR: PMM_CUSTOM_LABELS='$PMM_CUSTOM_LABELS' — expected key=value[,key=value...], keys like" >&2
+    echo "       [A-Za-z_][A-Za-z0-9_]*, values of letters, digits, '.', '_' and '-'." >&2; bad=1
+  fi
+  for v in DB_PORT LOCAL_PROXY_PORT; do
+    if ! [[ "${!v}" =~ ^[0-9]+$ ]] || [ "${!v}" -lt 1 ] || [ "${!v}" -gt 65535 ]; then
+      echo "ERROR: $v='${!v}' is not a TCP port (1-65535)." >&2; bad=1
+    fi
+  done
+  case "$PMM_FORCE_REREGISTER" in 0|1) ;; *)
+    echo "ERROR: PMM_FORCE_REREGISTER='$PMM_FORCE_REREGISTER' — must be 0 or 1." >&2; bad=1 ;;
+  esac
+  return "$bad"
+}
+
+# --- PMM ------------------------------------------------------------------------
+
+_PMM_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pmm_helper.py"
+
+# pmm_service_exists NAME — true iff a PMM service named EXACTLY NAME is
+# registered on this node (never a substring match: `prod-primary` must not
+# match `prod-primary-ro`).
+pmm_service_exists() {
+  pmm-admin --json list 2>/dev/null | python3 "$_PMM_HELPER" service-id "$1" >/dev/null
+}
+
+# pmm_slowlog_agent_id NAME — agent ID of NAME's QAN slowlog agent, or nothing.
 pmm_slowlog_agent_id() {
-  pmm-admin --json list 2>/dev/null | python3 -c '
-import json, sys
-try:
-    d = json.load(sys.stdin)
-except ValueError:
-    sys.exit(0)
-ids = {s.get("service_id") for s in d.get("service") or [] if s.get("service_name") == sys.argv[1]}
-for a in d.get("agent") or []:
-    if a.get("agent_type") == "AGENT_TYPE_QAN_MYSQL_SLOWLOG_AGENT" and a.get("service_id") in ids:
-        print(a["agent_id"])
-' "$1"
+  pmm-admin --json list 2>/dev/null | python3 "$_PMM_HELPER" slowlog-agent-id "$1" || true
+}
+
+# pmm_stale_services NAME PORT — MySQL services on this node at
+# 127.0.0.1:PORT under a name other than NAME (this sink's own service under a
+# previous PMM_SERVICE_NAME), one per line.
+pmm_stale_services() {
+  pmm-admin --json list 2>/dev/null | python3 "$_PMM_HELPER" stale-services "$1" "127.0.0.1:$2" || true
+}
+
+# pmm_slowlog_agent_status NAME — e.g. AGENT_STATUS_RUNNING, or nothing.
+pmm_slowlog_agent_status() {
+  pmm-admin --json list 2>/dev/null | python3 "$_PMM_HELPER" slowlog-agent-status "$1" || true
+}
+
+# pmm_local_status — prints "AGENT_ID NODE_ID NODE_NAME SERVER_HOST CONNECTED"
+# for the local pmm-agent ("-" for unknown fields; CONNECTED is true/false).
+# Works (all "-"/false) when pmm-client isn't installed or the agent is down.
+pmm_local_status() {
+  { pmm-admin --json status 2>/dev/null || true; } | python3 "$_PMM_HELPER" local-status
+}
+
+# pmm_service_owner NAME LOCAL_NODE_ID — exit 0 no such service on the PMM
+# Server, 1 registered on LOCAL_NODE_ID, 2 on another node (JSON details on
+# stdout), 3 API error. Needs PMM_SERVER/PMM_TOKEN.
+pmm_service_owner() {
+  PMM_SERVER="$PMM_SERVER" PMM_TOKEN="$PMM_TOKEN" python3 "$_PMM_HELPER" service-owner "$1" "$2"
+}
+
+# pmm_node_owner NAME LOCAL_AGENT_ID — exit 0 no such node, 1 ours, 2 another
+# machine's (JSON details on stdout), 3 API error. Needs PMM_SERVER/PMM_TOKEN
+# exported (the token is read from the environment, never argv).
+pmm_node_owner() {
+  PMM_SERVER="$PMM_SERVER" PMM_TOKEN="$PMM_TOKEN" python3 "$_PMM_HELPER" node-owner "$1" "$2"
+}
+
+# pmm_mint_token SA_NAME — prints a new token for Admin service account SA_NAME
+# (created if missing), using PMM's default admin:admin. Exit 1 on failure.
+pmm_mint_token() {
+  PMM_SERVER="$PMM_SERVER" python3 "$_PMM_HELPER" mint-token "$1"
 }
 
 # mysql_probe USER PASS HOST PORT CA_BUNDLE QUERY
