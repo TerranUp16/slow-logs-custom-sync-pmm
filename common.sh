@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# common.sh — shared helpers for setup.sh, verify-slow-log.sh, and destruct.sh.
+# common.sh — shared helpers for setup.sh, verify-slow-log.sh, diagnose.sh, and destruct.sh.
 # Not meant to be run directly; source it after `set -euo pipefail`.
 
 # Memoized per-process so a script that calls mysql_probe multiple times
@@ -54,6 +54,25 @@ ensure_mysql_client() {
   echo "  mysql client installed." >&2
   _MYSQL_CLIENT_ENSURED=1
   return 0
+}
+
+# pmm_slowlog_agent_id SERVICE_NAME
+#
+# Prints the agent ID of the QAN MySQL slowlog agent attached to the PMM
+# service named exactly SERVICE_NAME (matched on the service-name field of
+# `pmm-admin --json list`, not by substring), or nothing if there isn't one.
+pmm_slowlog_agent_id() {
+  pmm-admin --json list 2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except ValueError:
+    sys.exit(0)
+ids = {s.get("service_id") for s in d.get("service") or [] if s.get("service_name") == sys.argv[1]}
+for a in d.get("agent") or []:
+    if a.get("agent_type") == "AGENT_TYPE_QAN_MYSQL_SLOWLOG_AGENT" and a.get("service_id") in ids:
+        print(a["agent_id"])
+' "$1"
 }
 
 # mysql_probe USER PASS HOST PORT CA_BUNDLE QUERY

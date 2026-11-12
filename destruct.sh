@@ -135,13 +135,18 @@ if [ -n "$DB_HOST" ] && [ -n "$DB_PASS" ] && [ -f "$DO_CA_BUNDLE" ]; then
   SLOW_LOG_RESULT="$(mysql_probe "$PMM_MONITOR_USER" "$DB_PASS" "127.0.0.1" "$DB_PORT" "$DO_CA_BUNDLE" "SHOW VARIABLES LIKE 'slow_query_log_file';" 2>/dev/null || true)"
   SLOW_LOG_PATH="$(printf '%s' "$SLOW_LOG_RESULT" | awk '{print $2}')"
 fi
-if [ -n "$SLOW_LOG_PATH" ] && [ -L "$SLOW_LOG_PATH" ]; then
-  LINK_TARGET="$(readlink -f "$SLOW_LOG_PATH" 2>/dev/null || true)"
-  if [ "$LINK_TARGET" = "$PROCESSED_DIR/native_slow_query.log" ]; then
-    run "remove symlink $SLOW_LOG_PATH" rm -f "$SLOW_LOG_PATH"
-  else
-    echo "  WARNING: $SLOW_LOG_PATH doesn't point at our processed log ($LINK_TARGET) — leaving it alone."
-  fi
+if [ -n "$SLOW_LOG_PATH" ]; then
+  # <path>.old is what PMM's own slow-log rotation (disabled by current setup.sh,
+  # but possibly triggered under older versions) renames our symlink to.
+  for link in "$SLOW_LOG_PATH" "${SLOW_LOG_PATH}.old"; do
+    [ -L "$link" ] || continue
+    LINK_TARGET="$(readlink -f "$link" 2>/dev/null || true)"
+    if [ "$LINK_TARGET" = "$PROCESSED_DIR/native_slow_query.log" ]; then
+      run "remove symlink $link" rm -f "$link"
+    else
+      echo "  WARNING: $link doesn't point at our processed log ($LINK_TARGET) — leaving it alone."
+    fi
+  done
 else
   echo "  Could not resolve slow_query_log_file via DB (proxy/DB may already be down) — skipping."
   echo "  If you know the path, remove it manually: rm -f <slow_query_log_file>"
