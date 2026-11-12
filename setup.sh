@@ -536,6 +536,59 @@ if [ -L "${SLOW_LOG_PATH}.old" ] && [ "$(readlink -f "${SLOW_LOG_PATH}.old")" = 
   rm -f "${SLOW_LOG_PATH}.old"
   echo "  Removed stale ${SLOW_LOG_PATH}.old (left by a PMM-side rotation)"
 fi
+# Record it so destruct.sh removes every symlink this sink ever created (the
+# path changes across DB failovers; see the reconcile timer below).
+install -d -m 755 /var/lib/mysql_sink
+grep -qxF "$SLOW_LOG_PATH" /var/lib/mysql_sink/symlinks.list 2>/dev/null || echo "$SLOW_LOG_PATH" >> /var/lib/mysql_sink/symlinks.list
+
+echo "==> Installing slow_query_log_file reconcile timer (follows the path across DB failovers)"
+# DO's reported path embeds the serving node's hostname, so a primary failover
+# (or a resize, which replaces nodes) changes it; mysql_slowlog_agent then opens
+# the new path, and without a symlink there QAN stops until setup.sh is re-run.
+# The timer re-resolves the path every minute (one read-only SELECT through the
+# socat proxy) and adds the symlink if it's missing. Its DB credentials live in
+# a root-only options file, the same way mysql_probe passes them.
+install -d -m 755 /etc/mysql_sink
+( umask 077; cat > /etc/mysql_sink/reconcile.cnf <<EOF
+[client]
+user=${PMM_MONITOR_USER}
+password=${DB_PASS}
+host=127.0.0.1
+port=${LOCAL_PROXY_PORT}
+ssl-mode=VERIFY_CA
+ssl-ca=${DO_CA_BUNDLE}
+connect-timeout=10
+EOF
+)
+install -m 755 "$SCRIPT_DIR_LOCAL/reconcile-slowlog-symlink.sh" "$SCRIPT_DIR/reconcile-slowlog-symlink.sh"
+cat > /etc/systemd/system/mysql-sink-reconcile.service <<EOF
+[Unit]
+Description=Re-point the slow_query_log_file symlink after a DB failover (mysql-sink)
+After=socat-mysql-proxy.service
+
+[Service]
+Type=oneshot
+ExecStart=$SCRIPT_DIR/reconcile-slowlog-symlink.sh
+# Root: the symlink lives under the DB-reported path (e.g. /var/lib/mysql/...).
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+EOF
+cat > /etc/systemd/system/mysql-sink-reconcile.timer <<'EOF'
+[Unit]
+Description=Check the DB's slow_query_log_file path every minute (mysql-sink)
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
+EOF
+systemctl daemon-reload
+systemctl enable --now mysql-sink-reconcile.timer
 
 echo "==> Registering MySQL service '${PMM_SERVICE_NAME}' in PMM"
 # PMM_SERVICE_NAME changed since the last run? Then this sink's service is

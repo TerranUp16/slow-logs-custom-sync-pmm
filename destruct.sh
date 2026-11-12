@@ -9,7 +9,8 @@
 #     and THIS node's registration/agents
 #     (pmm-admin commands are scoped to the local agent's own node, so this
 #     never touches other nodes/services in your PMM inventory)
-#   - systemd: slow-query-sink.service, socat-mysql-proxy.service
+#   - systemd: slow-query-sink.service, socat-mysql-proxy.service,
+#     mysql-sink-reconcile.{service,timer}
 #   - rsyslog: the mTLS listener config + its cert/key/CA copies
 #   - the slow_query_log_file symlink on the DB side (best-effort, needs the
 #     DB to still be reachable to resolve the path)
@@ -77,7 +78,7 @@ run() {
 echo "This will remove everything setup.sh created for the '${PMM_SERVICE_NAME}'"
 echo "integration on THIS droplet and its PMM node/service registration:"
 echo "  - PMM: the '${PMM_SERVICE_NAME}' service + this node's registration/agents"
-echo "  - systemd: slow-query-sink.service, socat-mysql-proxy.service"
+echo "  - systemd: slow-query-sink.service, socat-mysql-proxy.service, mysql-sink-reconcile.timer"
 echo "  - rsyslog: the mTLS listener config + its cert/key/CA copies"
 echo "  - the slow_query_log_file symlink on the DB side (if resolvable)"
 echo "  - /etc/mysql_sink, logrotate config, the mysqlsink system user"
@@ -122,15 +123,31 @@ else
 fi
 
 echo "==> 3/9 Removing symlink at slow_query_log_file (best-effort DB lookup)"
+# Stop the reconcile timer first, or it could re-create a symlink we just removed.
+run "stop+disable mysql-sink-reconcile.timer" systemctl disable --now mysql-sink-reconcile.timer
 SLOW_LOG_PATH=""
 if [ -n "$DB_HOST" ] && [ -n "$DB_PASS" ] && [ -f "$DO_CA_BUNDLE" ]; then
   SLOW_LOG_RESULT="$(mysql_probe "$PMM_MONITOR_USER" "$DB_PASS" "127.0.0.1" "$LOCAL_PROXY_PORT" "$DO_CA_BUNDLE" "SHOW VARIABLES LIKE 'slow_query_log_file';" 2>/dev/null || true)"
   SLOW_LOG_PATH="$(printf '%s' "$SLOW_LOG_RESULT" | awk '{print $2}')"
 fi
-if [ -n "$SLOW_LOG_PATH" ]; then
-  # <path>.old is what PMM's own slow-log rotation (disabled by current setup.sh,
-  # but possibly triggered under older versions) renames our symlink to.
-  for link in "$SLOW_LOG_PATH" "${SLOW_LOG_PATH}.old"; do
+# Every path setup.sh / the reconcile timer ever symlinked (it changes across
+# DB failovers), plus the current one and PMM's rotation leftover (<path>.old).
+LINKS=()
+if [ -f /var/lib/mysql_sink/symlinks.list ]; then
+  while read -r l; do [ -n "$l" ] && LINKS+=("$l" "${l}.old"); done < /var/lib/mysql_sink/symlinks.list
+fi
+[ -n "$SLOW_LOG_PATH" ] && LINKS+=("$SLOW_LOG_PATH" "${SLOW_LOG_PATH}.old")
+# Plus any other symlink to OUR processed log in those same directories — e.g.
+# one for a pre-failover node created before the record above existed. Only
+# links that resolve to our own file are ever removed (checked below).
+if [ "${#LINKS[@]}" -gt 0 ]; then
+  while read -r d; do
+    [ -d "$d" ] || continue
+    while read -r l; do LINKS+=("$l"); done < <(find "$d" -maxdepth 1 -type l 2>/dev/null)
+  done < <(for l in "${LINKS[@]}"; do dirname "$l"; done | sort -u)
+fi
+if [ "${#LINKS[@]}" -gt 0 ]; then
+  while read -r link; do
     [ -L "$link" ] || continue
     LINK_TARGET="$(readlink -f "$link" 2>/dev/null || true)"
     if [ "$LINK_TARGET" = "$PROCESSED_DIR/native_slow_query.log" ]; then
@@ -138,13 +155,14 @@ if [ -n "$SLOW_LOG_PATH" ]; then
     else
       echo "  WARNING: $link doesn't point at our processed log ($LINK_TARGET) — leaving it alone."
     fi
-  done
+  done < <(printf '%s\n' "${LINKS[@]}" | sort -u)
 else
   echo "  Could not resolve slow_query_log_file via DB (proxy/DB may already be down) — skipping."
   echo "  If you know the path, remove it manually: rm -f <slow_query_log_file>"
 fi
 
 echo "==> 4/9 Stopping and removing systemd services"
+run "remove mysql-sink-reconcile unit files" rm -f /etc/systemd/system/mysql-sink-reconcile.timer /etc/systemd/system/mysql-sink-reconcile.service
 run "stop+disable slow-query-sink.service" systemctl disable --now slow-query-sink.service
 run "remove slow-query-sink.service unit file" rm -f /etc/systemd/system/slow-query-sink.service
 run "stop+disable socat-mysql-proxy.service" systemctl disable --now socat-mysql-proxy.service
@@ -168,6 +186,8 @@ fi
 
 echo "==> 7/9 Removing DO CA bundle and mysql_sink directories"
 run "remove DO CA bundle" rm -f "$DO_CA_BUNDLE"
+run "remove reconcile DB options file" rm -f /etc/mysql_sink/reconcile.cnf
+run "remove /var/lib/mysql_sink (symlink record)" rm -rf /var/lib/mysql_sink
 run "remove /etc/mysql_sink (if now empty)" rmdir --ignore-fail-on-non-empty "$(dirname "$DO_CA_BUNDLE")"
 if [ "$KEEP_LOGS" -eq 1 ]; then
   echo "  --keep-logs set — leaving /var/log/mysql_sink in place."

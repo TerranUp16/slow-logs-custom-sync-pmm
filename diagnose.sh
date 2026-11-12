@@ -226,6 +226,19 @@ else
 fi
 rm -f "$VERIFY_LOG"
 
+# The reconcile timer re-points the symlink when a DB failover changes
+# slow_query_log_file; without it, the symlink goes stale until setup.sh re-runs.
+if systemctl is-active --quiet mysql-sink-reconcile.timer 2>/dev/null; then
+  RECON_ERR="$(journalctl -u mysql-sink-reconcile --since '15 min ago' --no-pager -o cat 2>/dev/null | grep 'ERROR' | tail -1 || true)"
+  if [ -n "$RECON_ERR" ]; then
+    fail "mysql-sink-reconcile reported: ${RECON_ERR#reconcile: }"
+  else
+    pass "mysql-sink-reconcile.timer is active (follows slow_query_log_file across DB failovers)"
+  fi
+else
+  warn "mysql-sink-reconcile.timer is not active — after a DB failover the symlink won't follow the new slow_query_log_file path until setup.sh is re-run. Fix: bash setup.sh"
+fi
+
 if command -v pmm-admin >/dev/null 2>&1; then
   # Look up THIS sink's service by exact name, not "any mysql_slowlog_agent".
   SLOWLOG_ID="$(pmm_slowlog_agent_id "$PMM_SERVICE_NAME" | head -1)"
