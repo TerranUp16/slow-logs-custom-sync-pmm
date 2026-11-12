@@ -21,15 +21,8 @@ SCRIPT_DIR_LOCAL="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR_LOCAL/common.sh"
 
-if [ -f "$SCRIPT_DIR_LOCAL/.env" ]; then
-  set -a
-  # shellcheck disable=SC1091
-  source "$SCRIPT_DIR_LOCAL/.env"
-  set +a
-fi
+load_config "$SCRIPT_DIR_LOCAL"   # .env + defaults (common.sh)
 
-DB_PORT="${DB_PORT:-25060}"
-PMM_MONITOR_USER="${PMM_MONITOR_USER:-pmm_monitor}"
 DB_PASS="${DB_PASS:?Set DB_PASS in .env}"
 DO_CA_BUNDLE="${DO_CA_BUNDLE:-/etc/mysql_sink/do-ca.crt}"
 PROCESSED_DIR="/var/log/mysql_sink/processed"
@@ -49,8 +42,8 @@ if [ "$MODE" = "direct" ]; then
   RESULT=$(mysql_probe "$PMM_MONITOR_USER" "$DB_PASS" "$DB_HOST" "$DB_PORT" "$DO_CA_SRC" "SHOW VARIABLES LIKE 'slow_query_log_file';")
 else
   [ -f "$DO_CA_BUNDLE" ] || { echo "ERROR: $DO_CA_BUNDLE not found on this droplet — run setup.sh first, or pass --direct to test the DB directly instead of through the proxy." >&2; exit 1; }
-  echo "==> Querying DB through the socat proxy at 127.0.0.1:${DB_PORT}"
-  RESULT=$(mysql_probe "$PMM_MONITOR_USER" "$DB_PASS" "127.0.0.1" "$DB_PORT" "$DO_CA_BUNDLE" "SHOW VARIABLES LIKE 'slow_query_log_file';")
+  echo "==> Querying DB through the socat proxy at 127.0.0.1:${LOCAL_PROXY_PORT}"
+  RESULT=$(mysql_probe "$PMM_MONITOR_USER" "$DB_PASS" "127.0.0.1" "$LOCAL_PROXY_PORT" "$DO_CA_BUNDLE" "SHOW VARIABLES LIKE 'slow_query_log_file';")
 fi
 
 SLOW_LOG_PATH="$(printf '%s' "$RESULT" | awk '{print $2}')"

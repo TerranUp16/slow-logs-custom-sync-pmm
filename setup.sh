@@ -15,23 +15,21 @@ SCRIPT_DIR_LOCAL="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR_LOCAL/common.sh"
 
-# Load .env if present
-if [ -f "$SCRIPT_DIR_LOCAL/.env" ]; then
-  # .env holds DB_PASS and PMM_TOKEN — keep it owner-only regardless of how it
-  # was created (an editor or `cat >` leaves it at the umask default, 0644).
-  chmod 600 "$SCRIPT_DIR_LOCAL/.env"
-  set -a
-  # shellcheck disable=SC1091
-  source "$SCRIPT_DIR_LOCAL/.env"
-  set +a
-fi
+# .env holds DB_PASS and PMM_TOKEN — keep it owner-only regardless of how it
+# was created (an editor or `cat >` leaves it at the umask default, 0644).
+[ -f "$SCRIPT_DIR_LOCAL/.env" ] && chmod 600 "$SCRIPT_DIR_LOCAL/.env"
+# Sources .env and applies defaults for every optional key (common.sh).
+load_config "$SCRIPT_DIR_LOCAL"
 
 DB_HOST="${DB_HOST:?Set DB_HOST in .env}"
-DB_PORT="${DB_PORT:-25060}"
-PMM_MONITOR_USER="${PMM_MONITOR_USER:-pmm_monitor}"
 DB_PASS="${DB_PASS:?Set DB_PASS in .env}"
 PMM_SERVER="${PMM_SERVER:?Set PMM_SERVER in .env}"
+PMM_SERVER_HOST="${PMM_SERVER%%:*}"   # PMM_SERVER is documented as a bare host/IP; tolerate host:port
 PMM_TOKEN="${PMM_TOKEN:-}"
+validate_config || { echo "Fix the value(s) above in .env and re-run. Nothing has been changed." >&2; exit 1; }
+if [ "$PMM_SERVICE_NAME_DEFAULTED" -eq 1 ]; then
+  echo "NOTE: PMM_SERVICE_NAME not set — using the default 'do-managed-mysql'. Set a unique name per endpoint if more than one sink reports to this PMM Server."
+fi
 DO_CA_BUNDLE="${DO_CA_BUNDLE:-/etc/mysql_sink/do-ca.crt}"   # destination on the droplet
 DO_CA_SRC="${DO_CA_SRC:-$SCRIPT_DIR_LOCAL/certs/do-ca.crt}"  # local copy downloaded from DO control panel
 
@@ -103,44 +101,37 @@ Install PMM server first — SSH into that droplet and run:
   curl -fsSL https://www.percona.com/get/pmm | bash
 
 Then re-run this script. If nobody has logged into the PMM web UI yet (still
-on the default admin/admin password), this script will mint an Admin API
-token automatically. If the admin password has already been changed, log
-into https://${PMM_SERVER}, go to Settings -> API Keys -> Add API Key
-(role: Admin), and put the token into .env as PMM_TOKEN instead.
+on the default admin/admin password), this script will mint a token
+automatically. Otherwise create one by hand (RUNBOOK Step 1): log into
+https://${PMM_SERVER}, go to Administration -> Users and access -> Service
+Accounts -> Add service account (role: Admin), add a token to it, and put
+the token (glsa_...) into .env as PMM_TOKEN.
 INSTR
     exit 1
   fi
 
-  echo "==> PMM server reachable — attempting to mint an API token (default admin/admin)"
+  # One service account per sink, named after the node, so each sink's token
+  # can be found and revoked on its own (Administration -> Service Accounts).
+  SA_NAME="sink-${PMM_NODE_NAME}"
+  echo "==> PMM server reachable — attempting to mint a token for service account '${SA_NAME}' (default admin/admin)"
   # PMM 3 ships Grafana 9+, which replaced the legacy /api/auth/keys endpoint with
-  # Service Accounts: create a service account, then mint a token for it.
-  PMM_MINT_FAIL() {
+  # Service Accounts: create (or reuse) a service account, then mint a token.
+  if ! PMM_TOKEN="$(pmm_mint_token "$SA_NAME")" || [ -z "$PMM_TOKEN" ]; then
     cat >&2 <<INSTR
-ERROR: Could not auto-mint a PMM API token — default admin/admin credentials
+ERROR: Could not auto-mint a PMM token — the default admin/admin credentials
 were rejected (the admin password has likely already been changed via the
-PMM UI), or the PMM API returned an unexpected response.
+PMM UI), or the PMM API returned an unexpected response (see above).
 
-Log into https://${PMM_SERVER}, go to Settings -> API Keys -> Add API Key
-(role: Admin), and put the resulting token into .env as PMM_TOKEN. Then
-re-run this script.
+Create one by hand (RUNBOOK Step 1): log into https://${PMM_SERVER}, go to
+Administration -> Users and access -> Service Accounts -> Add service account
+(name it ${SA_NAME}, role: Admin), add a token to it, put the token (glsa_...)
+into .env as PMM_TOKEN, and re-run this script. Use one service account and
+token per sink, so each can be revoked independently.
 INSTR
     exit 1
-  }
-  SA_RESPONSE="$(curl -fsSk --max-time 10 -u admin:admin -X POST \
-    -H 'Content-Type: application/json' \
-    -d "{\"name\":\"sink-setup-$(date +%s)\",\"role\":\"Admin\"}" \
-    "https://${PMM_SERVER}/graph/api/serviceaccounts" 2>&1)" || PMM_MINT_FAIL
-  SA_ID="$(printf '%s' "$SA_RESPONSE" | grep -oP '"id"\s*:\s*\K[0-9]+' | head -1)"
-  [ -n "$SA_ID" ] || PMM_MINT_FAIL
+  fi
 
-  TOKEN_RESPONSE="$(curl -fsSk --max-time 10 -u admin:admin -X POST \
-    -H 'Content-Type: application/json' \
-    -d '{"name":"sink-setup-token"}' \
-    "https://${PMM_SERVER}/graph/api/serviceaccounts/${SA_ID}/tokens" 2>&1)" || PMM_MINT_FAIL
-  PMM_TOKEN="$(printf '%s' "$TOKEN_RESPONSE" | grep -oP '"key"\s*:\s*"[^"]*"' | sed -E 's/.*:"//; s/"$//')"
-  [ -n "$PMM_TOKEN" ] || PMM_MINT_FAIL
-
-  echo "==> Minted PMM API token — writing PMM_TOKEN into .env"
+  echo "==> Minted a token for service account '${SA_NAME}' — writing PMM_TOKEN into .env"
   # awk reads the token from its environment, not its argv (a sed expression
   # would put the token in `ps` output), and the rewrite goes through a 0600
   # mktemp file so .env is never briefly world-readable or half-written.
@@ -154,8 +145,80 @@ INSTR
     END { if (!done) print "PMM_TOKEN=" t }
   ' "$ENV_FILE" > "$ENV_TMP"
   mv "$ENV_TMP" "$ENV_FILE"
-  echo "  NOTE: only the .env copy on this host was updated — copy PMM_TOKEN back"
-  echo "  into your local repo's .env if you want it to persist for future runs."
+fi
+
+echo "==> Preflight: PMM identity (node '${PMM_NODE_NAME}', service '${PMM_SERVICE_NAME}')"
+# `pmm-admin config --force` removes any existing node WITH THIS NAME — and all
+# its services and agents — so before registering, make sure a node by that
+# name isn't some other machine's (e.g. a second sink with the same hostname),
+# and that the service name isn't already taken by another node. Both are
+# read-only API lookups; nothing has been changed on the PMM Server yet.
+read -r LOCAL_AGENT_ID LOCAL_NODE_ID LOCAL_NODE_NAME LOCAL_SERVER LOCAL_CONNECTED < <(pmm_local_status)
+# pmm-admin can't report the agent ID while pmm-agent is stopped; its config
+# file still has it, and that's what the ownership check needs.
+if [ "$LOCAL_AGENT_ID" = "-" ] && [ -f /usr/local/percona/pmm/config/pmm-agent.yaml ]; then
+  LOCAL_AGENT_ID="$(awk '$1 == "id:" { print $2; exit }' /usr/local/percona/pmm/config/pmm-agent.yaml)"
+  LOCAL_AGENT_ID="${LOCAL_AGENT_ID:--}"
+fi
+SKIP_PMM_CONFIG=0
+if [ "$LOCAL_CONNECTED" = "true" ] && [ "$LOCAL_SERVER" = "$PMM_SERVER_HOST" ] \
+   && [ "$LOCAL_NODE_NAME" = "$PMM_NODE_NAME" ] && [ "$PMM_FORCE_REREGISTER" != "1" ]; then
+  # Re-run on an already-registered sink: keep the node (and its IDs) as is.
+  SKIP_PMM_CONFIG=1
+  echo "  This machine is already registered and connected as node '${PMM_NODE_NAME}' — keeping that registration."
+else
+  # `|| RC=$?` (not set +e) so the ERR trap doesn't report these expected
+  # non-zero verdicts as a crash.
+  OWNER_RC=0; OWNER_DETAILS="$(pmm_node_owner "$PMM_NODE_NAME" "${LOCAL_AGENT_ID#-}")" || OWNER_RC=$?
+  case "$OWNER_RC" in
+    0) echo "  No node named '${PMM_NODE_NAME}' on the PMM Server yet." ;;
+    1) echo "  Node '${PMM_NODE_NAME}' exists and belongs to this machine — re-registering it." ;;
+    2)
+      if [ "$PMM_FORCE_REREGISTER" = "1" ]; then
+        echo "WARNING: node '${PMM_NODE_NAME}' belongs to a different pmm-agent (${OWNER_DETAILS});" >&2
+        echo "  PMM_FORCE_REREGISTER=1, so it will be REPLACED — with all its services and agents." >&2
+      else
+        cat >&2 <<MSG
+ERROR: a PMM node named '${PMM_NODE_NAME}' already exists and is NOT this machine's:
+  ${OWNER_DETAILS}
+Registering would remove it, with all of its services and agents (pmm-admin
+config --force). Usually this means another sink has the same hostname.
+  - Give this sink its own name: set PMM_NODE_NAME=<unique name> in .env, or
+  - if that node really is stale (e.g. its Droplet was deleted), re-run with
+    PMM_FORCE_REREGISTER=1 to replace it.
+Nothing has been changed on this Droplet or the PMM Server.
+MSG
+        exit 1
+      fi
+      ;;
+    *)
+      if [ "$PMM_FORCE_REREGISTER" = "1" ]; then
+        echo "WARNING: couldn't verify who owns node '${PMM_NODE_NAME}' (see above); continuing because PMM_FORCE_REREGISTER=1." >&2
+      else
+        echo "ERROR: couldn't verify whether node '${PMM_NODE_NAME}' belongs to another machine (see above)," >&2
+        echo "  so registering could silently remove it. Fix PMM_SERVER/PMM_TOKEN, or re-run with" >&2
+        echo "  PMM_FORCE_REREGISTER=1 if you're sure. Nothing has been changed." >&2
+        exit 1
+      fi
+      ;;
+  esac
+fi
+if [ "$PMM_FORCE_REREGISTER" != "1" ]; then
+  # The local node ID only counts if it's on this same PMM Server.
+  [ "$LOCAL_SERVER" = "$PMM_SERVER_HOST" ] || LOCAL_NODE_ID="-"
+  SVC_RC=0; SVC_DETAILS="$(pmm_service_owner "$PMM_SERVICE_NAME" "${LOCAL_NODE_ID#-}")" || SVC_RC=$?
+  if [ "$SVC_RC" -eq 2 ]; then
+    cat >&2 <<MSG
+ERROR: PMM service name '${PMM_SERVICE_NAME}' is already used by another node:
+  ${SVC_DETAILS}
+PMM service names must be unique per PMM Server. Set PMM_SERVICE_NAME=<unique
+name> in .env for this endpoint (RUNBOOK: "Monitoring multiple Managed MySQL
+endpoints with one PMM Server"). Nothing has been changed.
+MSG
+    exit 1
+  elif [ "$SVC_RC" -eq 3 ]; then
+    echo "WARNING: couldn't check whether service name '${PMM_SERVICE_NAME}' is free (see above); continuing." >&2
+  fi
 fi
 
 echo "==> Creating dedicated unprivileged service user"
@@ -323,15 +386,17 @@ else
   echo "  pmm-client already installed: $(pmm-admin --version 2>&1 | head -1)"
 fi
 
-echo "==> Creating socat proxy systemd service"
+echo "==> Creating socat proxy systemd service (127.0.0.1:${LOCAL_PROXY_PORT} -> ${DB_HOST}:${DB_PORT})"
+# LOCAL_PROXY_PORT (default: DB_PORT) is the local side every consumer uses —
+# pmm-agent, mysql_probe, verify/diagnose, test_prepared_statements.py.
 cat > /etc/systemd/system/socat-mysql-proxy.service <<EOF
 [Unit]
-Description=TCP proxy – local 25060 -> DO Managed MySQL
+Description=TCP proxy – local ${LOCAL_PROXY_PORT} -> DO Managed MySQL
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/socat TCP4-LISTEN:25060,fork,reuseaddr,bind=127.0.0.1 TCP4:${DB_HOST}:${DB_PORT}
+ExecStart=/usr/bin/socat TCP4-LISTEN:${LOCAL_PROXY_PORT},fork,reuseaddr,bind=127.0.0.1 TCP4:${DB_HOST}:${DB_PORT}
 Restart=always
 RestartSec=5
 
@@ -393,15 +458,43 @@ $INCOMING_DIR/combined_mysql.log {
 }
 EOF
 
-echo "==> Configuring PMM 3 client"
-# NOTE: pmm-admin has no way to pass the service token outside the URL, so it is
-# briefly visible in argv/ps during this one-shot config call (run as root).
-# --server-insecure-tls is retained because the PMM server uses a self-signed,
-# IP-addressed cert; pin the PMM CA here once the server has a verifiable cert.
-pmm-admin config \
-  --force \
-  --server-insecure-tls \
-  --server-url="https://service_token:${PMM_TOKEN}@${PMM_SERVER}:443"
+echo "==> Configuring PMM 3 client (node '${PMM_NODE_NAME}')"
+if [ "$SKIP_PMM_CONFIG" -eq 1 ]; then
+  # Already registered and connected as this node (preflight above). Re-running
+  # `pmm-admin config --force` here would delete and recreate the node and every
+  # service on it, changing their IDs on every setup.sh run. Set
+  # PMM_FORCE_REREGISTER=1 to re-register anyway (e.g. after rotating PMM_TOKEN
+  # while the old token still works).
+  echo "  Already registered and connected — leaving the node registration as is."
+else
+  if [ "$LOCAL_CONNECTED" = "true" ] && [ "$LOCAL_SERVER" = "$PMM_SERVER_HOST" ] \
+     && [ "$LOCAL_NODE_NAME" != "-" ] && [ "$LOCAL_NODE_NAME" != "$PMM_NODE_NAME" ]; then
+    # PMM_NODE_NAME changed: retire this machine's own old node (and its
+    # services) first, rather than leaving it orphaned on the PMM Server.
+    echo "  Node name changed ('${LOCAL_NODE_NAME}' -> '${PMM_NODE_NAME}') — unregistering this machine's old node first."
+    pmm-admin unregister --force
+  fi
+  # pmm-admin takes the node name only as the 3rd positional argument, after
+  # address and type, so they're passed only when PMM_NODE_NAME is explicitly
+  # set. Unset, the call is exactly what it always was and pmm-admin
+  # autodetects all three (node name = `hostname`).
+  NODE_ARGS=()
+  if [ "$PMM_NODE_NAME_SET" -eq 1 ]; then
+    NODE_ADDRESS="${SINK_IP:-$(hostname -I | awk '{print $1}')}"
+    NODE_ARGS=("$NODE_ADDRESS" generic "$PMM_NODE_NAME")
+  fi
+  # NOTE: pmm-admin has no way to pass the service token outside the URL, so it is
+  # briefly visible in argv/ps during this one-shot config call (run as root).
+  # --server-insecure-tls is retained because the PMM server uses a self-signed,
+  # IP-addressed cert; pin the PMM CA here once the server has a verifiable cert.
+  # --force replaces an existing node with this name — the preflight above has
+  # already established that it's this machine's own (or PMM_FORCE_REREGISTER=1).
+  pmm-admin config \
+    --force \
+    --server-insecure-tls \
+    --server-url="https://service_token:${PMM_TOKEN}@${PMM_SERVER}:443" \
+    "${NODE_ARGS[@]}"
+fi
 
 # Allow pmm-agent to read the processed log (group adm, mode 640). The file may
 # not exist yet (the daemon creates it on first data); if it does, normalize it
@@ -422,7 +515,7 @@ echo "==> Resolving slow_query_log_file path from DB (via socat proxy)"
 # instead of swallowing it with a blanket 2>/dev/null.
 [ -f "$DO_CA_BUNDLE" ] || { echo "ERROR: DO_CA_BUNDLE ($DO_CA_BUNDLE) not found — download the CA cert from the DO DB control panel" >&2; exit 1; }
 
-SLOW_LOG_RESULT=$(mysql_probe "$PMM_MONITOR_USER" "$DB_PASS" "127.0.0.1" "$DB_PORT" "$DO_CA_BUNDLE" "SHOW VARIABLES LIKE 'slow_query_log_file';") || exit 1
+SLOW_LOG_RESULT=$(mysql_probe "$PMM_MONITOR_USER" "$DB_PASS" "127.0.0.1" "$LOCAL_PROXY_PORT" "$DO_CA_BUNDLE" "SHOW VARIABLES LIKE 'slow_query_log_file';") || exit 1
 SLOW_LOG_PATH="$(printf '%s' "$SLOW_LOG_RESULT" | awk '{print $2}')"
 
 if [ -z "$SLOW_LOG_PATH" ]; then
@@ -444,34 +537,55 @@ if [ -L "${SLOW_LOG_PATH}.old" ] && [ "$(readlink -f "${SLOW_LOG_PATH}.old")" = 
   echo "  Removed stale ${SLOW_LOG_PATH}.old (left by a PMM-side rotation)"
 fi
 
-echo "==> Registering MySQL service in PMM"
-if pmm-admin list 2>/dev/null | grep -q 'do-managed-mysql'; then
-  echo "  Service do-managed-mysql already registered, skipping."
-else
-  # Residual limitations (pmm-admin tooling, not config choices):
-  #  - --password is the only way to supply credentials; briefly visible in argv.
-  #  - --tls-skip-verify stays: the agent connects to 127.0.0.1 (socat) while the
-  #    DB cert is issued for the DO hostname, so strict verification can't match.
-  #    The DB hop is still TLS-encrypted end-to-end through the socat passthrough.
-  # PMM's own slow-log rotation is disabled in the next step rather than with
-  # --size-slow-logs here: pmm-admin 3.10 rejects the documented "-1" ("unknown
-  # unit") and only takes "-1B", and the next step has to exist anyway to fix
-  # services registered by older versions of this script.
-  pmm-admin add mysql \
-    --username="$PMM_MONITOR_USER" \
-    --password="$DB_PASS" \
-    --host=127.0.0.1 \
-    --port="$DB_PORT" \
-    --query-source=slowlog \
-    --tls \
-    --tls-skip-verify \
-    --skip-connection-check \
-    do-managed-mysql
+echo "==> Registering MySQL service '${PMM_SERVICE_NAME}' in PMM"
+# PMM_SERVICE_NAME changed since the last run? Then this sink's service is
+# still registered under the old name on the same local proxy port — remove it
+# rather than leave a dead duplicate of this endpoint in PMM.
+while read -r OLD_SVC; do
+  [ -n "$OLD_SVC" ] || continue
+  echo "  Removing this sink's previous service '${OLD_SVC}' (same 127.0.0.1:${LOCAL_PROXY_PORT}; PMM_SERVICE_NAME is now '${PMM_SERVICE_NAME}')."
+  pmm-admin remove mysql "$OLD_SVC"
+done < <(pmm_stale_services "$PMM_SERVICE_NAME" "$LOCAL_PROXY_PORT")
+if pmm_service_exists "$PMM_SERVICE_NAME"; then
+  # Re-register rather than skip, so a re-run applies the current .env —
+  # a new DB_PASS after a DB replacement, a changed LOCAL_PROXY_PORT or labels.
+  # (pmm-admin can't change most of these on an existing service, and the old
+  # password can't be read back to compare.) QAN history is kept: it's
+  # filtered by service name, which doesn't change.
+  echo "  Service '${PMM_SERVICE_NAME}' already registered on this node — re-registering it with the current .env."
+  pmm-admin remove mysql "$PMM_SERVICE_NAME"
 fi
+# Optional grouping labels, passed only when set (for comparing endpoints, e.g.
+# primary vs replica, or old vs new clusters, in one PMM).
+LABEL_ARGS=()
+[ -n "$PMM_ENVIRONMENT" ]     && LABEL_ARGS+=(--environment="$PMM_ENVIRONMENT")
+[ -n "$PMM_CLUSTER" ]         && LABEL_ARGS+=(--cluster="$PMM_CLUSTER")
+[ -n "$PMM_REPLICATION_SET" ] && LABEL_ARGS+=(--replication-set="$PMM_REPLICATION_SET")
+[ -n "$PMM_CUSTOM_LABELS" ]   && LABEL_ARGS+=(--custom-labels="$PMM_CUSTOM_LABELS")
+# Residual limitations (pmm-admin tooling, not config choices):
+#  - --password is the only way to supply credentials; briefly visible in argv.
+#  - --tls-skip-verify stays: the agent connects to 127.0.0.1 (socat) while the
+#    DB cert is issued for the DO hostname, so strict verification can't match.
+#    The DB hop is still TLS-encrypted end-to-end through the socat passthrough.
+# PMM's own slow-log rotation is disabled in the next step rather than with
+# --size-slow-logs here: pmm-admin 3.10 rejects the documented "-1" ("unknown
+# unit") and only takes "-1B", and the next step has to exist anyway to fix
+# services registered by older versions of this script.
+pmm-admin add mysql \
+  --username="$PMM_MONITOR_USER" \
+  --password="$DB_PASS" \
+  --host=127.0.0.1 \
+  --port="$LOCAL_PROXY_PORT" \
+  --query-source=slowlog \
+  --tls \
+  --tls-skip-verify \
+  --skip-connection-check \
+  "${LABEL_ARGS[@]}" \
+  "$PMM_SERVICE_NAME"
 
 echo "==> Verifying service registration"
-if ! pmm-admin list 2>/dev/null | grep -q 'do-managed-mysql'; then
-  echo "ERROR: 'do-managed-mysql' does not appear in 'pmm-admin list' after registration." >&2
+if ! pmm_service_exists "$PMM_SERVICE_NAME"; then
+  echo "ERROR: '${PMM_SERVICE_NAME}' does not appear in 'pmm-admin list' after registration." >&2
   echo "Check: pmm-admin status ; journalctl -u pmm-agent -n 50" >&2
   exit 1
 fi
@@ -487,9 +601,9 @@ echo "==> Disabling PMM's built-in slow-log rotation (logrotate owns rotation he
 # Applies to a service registered just now and, in place, to one registered by
 # an older version of this script (which got PMM's 1 GiB default). Idempotent:
 # PMM stores 0 as "no limit" and the agent skips rotation for sizes <= 0.
-SLOWLOG_AGENT_ID="$(pmm_slowlog_agent_id do-managed-mysql)"
+SLOWLOG_AGENT_ID="$(pmm_slowlog_agent_id "$PMM_SERVICE_NAME")"
 if [ -z "$SLOWLOG_AGENT_ID" ]; then
-  echo "ERROR: no QAN slowlog agent found for service 'do-managed-mysql' in 'pmm-admin --json list'." >&2
+  echo "ERROR: no QAN slowlog agent found for service '${PMM_SERVICE_NAME}' in 'pmm-admin --json list'." >&2
   echo "Check: pmm-admin list ; journalctl -u pmm-agent -n 50" >&2
   exit 1
 fi

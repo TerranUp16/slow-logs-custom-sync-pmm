@@ -22,22 +22,15 @@ SCRIPT_DIR_LOCAL="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR_LOCAL/common.sh"
 
-if [ -f "$SCRIPT_DIR_LOCAL/.env" ]; then
-  set -a
-  # shellcheck disable=SC1091
-  source "$SCRIPT_DIR_LOCAL/.env"
-  set +a
-fi
+load_config "$SCRIPT_DIR_LOCAL"   # .env + defaults (common.sh), incl. LOCAL_PROXY_PORT, PMM_SERVICE_NAME
 
-DB_HOST="${DB_HOST:-}"
-DB_PORT="${DB_PORT:-25060}"
-PMM_MONITOR_USER="${PMM_MONITOR_USER:-pmm_monitor}"
-DB_PASS="${DB_PASS:-}"
 DO_CA_BUNDLE="${DO_CA_BUNDLE:-/etc/mysql_sink/do-ca.crt}"
 DO_CA_SRC="${DO_CA_SRC:-$SCRIPT_DIR_LOCAL/certs/do-ca.crt}"
 TLS_DIR="/etc/rsyslog.d/tls"
 INCOMING_FILE="/var/log/mysql_sink/incoming/combined_mysql.log"
 PROCESSED_FILE="/var/log/mysql_sink/processed/native_slow_query.log"
+# Every TCP port DO Log Forwarding connects to on this sink (one listener today).
+SYSLOG_PORTS=(6514)
 
 MODE="proxy"
 if [ "${1:-}" = "--direct" ]; then
@@ -63,12 +56,12 @@ echo "is usually the real cause of FAILs/WARNs further down, not a separate prob
 # --- 1: DB slow-query configuration -----------------------------------------
 section "1/9 DB slow-query configuration"
 if [ "$MODE" = "direct" ]; then
-  DB_QUERY_HOST="$DB_HOST"; DB_QUERY_CA="$DO_CA_SRC"
+  DB_QUERY_HOST="$DB_HOST"; DB_QUERY_PORT="$DB_PORT"; DB_QUERY_CA="$DO_CA_SRC"
 else
-  DB_QUERY_HOST="127.0.0.1"; DB_QUERY_CA="$DO_CA_BUNDLE"
+  DB_QUERY_HOST="127.0.0.1"; DB_QUERY_PORT="$LOCAL_PROXY_PORT"; DB_QUERY_CA="$DO_CA_BUNDLE"
 fi
 if [ -n "$DB_HOST" ] && [ -n "$DB_PASS" ] && [ -f "$DB_QUERY_CA" ]; then
-  DB_VARS="$(mysql_probe "$PMM_MONITOR_USER" "$DB_PASS" "$DB_QUERY_HOST" "$DB_PORT" "$DB_QUERY_CA" \
+  DB_VARS="$(mysql_probe "$PMM_MONITOR_USER" "$DB_PASS" "$DB_QUERY_HOST" "$DB_QUERY_PORT" "$DB_QUERY_CA" \
     "SELECT @@slow_query_log, @@log_output, @@long_query_time;" 2>/dev/null || true)"
   if [ -n "$DB_VARS" ]; then
     read -r SLOW_ON LOG_OUT LONG_TIME <<<"$DB_VARS"
@@ -99,11 +92,24 @@ else
 fi
 
 # --- 3: TLS syslog listener ---------------------------------------------------
-section "3/9 TLS syslog listener (port 6514)"
-if command -v ss >/dev/null 2>&1 && ss -tln 2>/dev/null | grep -q ':6514'; then
-  pass "something is listening on 6514/tcp"
+section "3/9 Listeners (TLS syslog ${SYSLOG_PORTS[*]}, socat proxy 127.0.0.1:${LOCAL_PROXY_PORT})"
+# Exact port match on ss's local-address column (":6514" must not match ":65140").
+listening() { ss -tlnH 2>/dev/null | awk -v p="$1" '{ n = split($4, a, ":"); if (a[n] == p) found = 1 } END { exit !found }'; }
+if command -v ss >/dev/null 2>&1; then
+  for p in "${SYSLOG_PORTS[@]}"; do
+    if listening "$p"; then
+      pass "something is listening on ${p}/tcp"
+    else
+      fail "nothing is listening on ${p}/tcp — rsyslog's imtcp module may have failed to load; check journalctl -u rsyslog -n 50 for module load errors"
+    fi
+  done
+  if listening "$LOCAL_PROXY_PORT"; then
+    pass "socat proxy is listening on ${LOCAL_PROXY_PORT}/tcp (LOCAL_PROXY_PORT)"
+  else
+    fail "nothing is listening on ${LOCAL_PROXY_PORT}/tcp (LOCAL_PROXY_PORT) — systemctl status socat-mysql-proxy ; journalctl -u socat-mysql-proxy -n 50"
+  fi
 else
-  fail "nothing is listening on 6514/tcp — rsyslog's imtcp module may have failed to load; check journalctl -u rsyslog -n 50 for module load errors"
+  warn "ss not available — skipping"
 fi
 
 # --- 4: TLS certificate files -------------------------------------------------
@@ -145,15 +151,17 @@ fi
 # --- 6: firewall --------------------------------------------------------------
 section "6/9 Firewall (ufw)"
 if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
-  if ufw status | grep -q '6514'; then
-    pass "ufw allows 6514/tcp"
-  else
-    fail "ufw is active but shows no rule for 6514/tcp — ufw allow 6514/tcp"
-  fi
+  for p in "${SYSLOG_PORTS[@]}"; do
+    if ufw status | grep -qE "^${p}(/tcp)?[[:space:]]"; then
+      pass "ufw allows ${p}/tcp"
+    else
+      fail "ufw is active but shows no rule for ${p}/tcp — ufw allow ${p}/tcp"
+    fi
+  done
 else
   echo "  ufw not active on this Droplet — nothing to check here."
   echo "  Remember: a separate DO Cloud Firewall (if one is attached to this Droplet in the"
-  echo "  DO control panel) is NOT visible to this script and could independently block 6514."
+  echo "  DO control panel) is NOT visible to this script and could independently block ${SYSLOG_PORTS[*]}."
 fi
 
 # --- 7: incoming syslog file --------------------------------------------------
@@ -219,22 +227,24 @@ fi
 rm -f "$VERIFY_LOG"
 
 if command -v pmm-admin >/dev/null 2>&1; then
-  AGENT_LINE="$(pmm-admin list 2>/dev/null | grep mysql_slowlog_agent || true)"
-  if [ -n "$AGENT_LINE" ]; then
-    echo "  $AGENT_LINE"
+  # Look up THIS sink's service by exact name, not "any mysql_slowlog_agent".
+  SLOWLOG_ID="$(pmm_slowlog_agent_id "$PMM_SERVICE_NAME" | head -1)"
+  if [ -n "$SLOWLOG_ID" ]; then
+    SLOWLOG_STATUS="$(pmm_slowlog_agent_status "$PMM_SERVICE_NAME" | head -1)"
+    echo "  service '${PMM_SERVICE_NAME}': slowlog agent ${SLOWLOG_ID} ${SLOWLOG_STATUS}"
     # "Running" is necessary but not sufficient: if the path it tails vanishes
     # (e.g. PMM's own rotation renamed our symlink), the agent stays "Running"
     # while logging "Failed to stat" every second and sending nothing.
-    STAT_ERRORS="$(journalctl -u pmm-agent --since '5 min ago' --no-pager 2>/dev/null | grep -c 'Failed to stat' || true)"
+    STAT_ERRORS="$(journalctl -u pmm-agent --since '5 min ago' --no-pager 2>/dev/null | grep 'Failed to stat' | grep -c "agentID=${SLOWLOG_ID}" || true)"
     if [ "${STAT_ERRORS:-0}" -gt 0 ]; then
-      fail "mysql_slowlog_agent reports Running, but pmm-agent logged $STAT_ERRORS 'Failed to stat' error(s) in the last 5 min — the slow-log path it tails is missing (see verify-slow-log.sh output above). Fix: git pull && bash setup.sh"
-    elif echo "$AGENT_LINE" | grep -q 'Running'; then
-      pass "mysql_slowlog_agent is Running"
+      fail "the slowlog agent reports ${SLOWLOG_STATUS}, but pmm-agent logged $STAT_ERRORS 'Failed to stat' error(s) for it in the last 5 min — the slow-log path it tails is missing (see verify-slow-log.sh output above). Fix: git pull && bash setup.sh"
+    elif [ "$SLOWLOG_STATUS" = "RUNNING" ] || [ "$SLOWLOG_STATUS" = "AGENT_STATUS_RUNNING" ]; then
+      pass "slowlog agent for '${PMM_SERVICE_NAME}' is Running"
     else
-      warn "mysql_slowlog_agent is not Running yet — it commonly shows 'Waiting' until $PROCESSED_FILE exists and has content, which will resolve once stages 7-8 above are fixed"
+      warn "slowlog agent for '${PMM_SERVICE_NAME}' is ${SLOWLOG_STATUS:-not Running} — it commonly shows 'Waiting' until $PROCESSED_FILE exists and has content, which will resolve once stages 7-8 above are fixed"
     fi
   else
-    fail "mysql_slowlog_agent not found in pmm-admin list — was the MySQL service registered by setup.sh?"
+    fail "no PMM service named exactly '${PMM_SERVICE_NAME}' with a slowlog agent on this node — was it registered by setup.sh? (pmm-admin list)"
   fi
 else
   warn "pmm-admin not installed — skipping"
