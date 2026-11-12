@@ -316,7 +316,7 @@ bash setup.sh
    machine's and the service name isn't already used by another node. If this
    Droplet is already registered and connected under that name, the node
    registration is left as is.
-7. Queries the DB for its `slow_query_log_file` path and symlinks it to the processed log.
+7. Queries the DB for its `slow_query_log_file` path and symlinks it to the processed log, and installs `mysql-sink-reconcile.timer`, which re-checks that path every minute and adds the symlink when it changes — DO's path embeds the serving node's hostname, so it changes on every primary failover (see Troubleshooting).
 8. Registers the MySQL service (`PMM_SERVICE_NAME`) in PMM with `--query-source=slowlog` and any labels set in `.env`, and verifies it actually appears in `pmm-admin list`.
 
 It's idempotent — safe to re-run after fixing a config issue, and after a
@@ -632,6 +632,7 @@ applies, rather than you needing to guess from the symptom alone.
 | "Discarding stale incomplete block" in daemon logs | A multi-line slow query block arrived with missing lines — likely a transient rsyslog drop; normal at low frequency. (Older versions of `transform_logs.py` also logged this for the last, *complete* query before every quiet period — and dropped it — and logged every host as `host=unknown`. If you see `host=unknown`, you're on old code: `git pull && bash setup.sh`.) |
 | QAN worked for about a day, then stopped; `native_slow_query.log` is empty or tiny while `native_slow_query.log.1` keeps growing | Old `transform_logs.py`: it never reopened its output after logrotate's daily rotation, so it kept writing to the rotated file while PMM read the new, empty one. `diagnose.sh` stage 8 reports "daemon is writing to '…log.1'". Fix: `git pull && bash setup.sh` (it restarts the daemon on the new code) |
 | QAN stopped; the `slow_query_log_file` symlink is gone but `<that path>.old` exists; `journalctl -u pmm-agent` repeats `Failed to stat … no such file or directory` while `pmm-admin list` still shows `mysql_slowlog_agent Running` | PMM's own slow-log rotation fired (default limit 1 GiB): it renames the slow-log path to `.old` and expects `mysqld` to recreate it, which can't happen here. Fix: `git pull && bash setup.sh` — it recreates the symlink, removes the stale `.old`, and sets the service's PMM-side rotation limit to 0 (disabled). `diagnose.sh` and `verify-slow-log.sh` both detect this state |
+| QAN stopped right after a DB failover, maintenance or resize; `pmm-admin list` shows the slowlog agent `Waiting`; `verify-slow-log.sh` says the `slow_query_log_file` path doesn't exist | Expected for up to ~1 minute. DO's `slow_query_log_file` embeds the serving node's hostname (`…/<cluster>-<n>-slow.log`), and a failover — or a resize, which replaces nodes — moves the primary to a node with a different `<n>` (observed: `-1` → `-4`). `mysql-sink-reconcile.timer` notices within a minute and adds the symlink at the new path; the slowlog agent resumes by itself. If it doesn't: `systemctl status mysql-sink-reconcile.timer` and `journalctl -u mysql-sink-reconcile -n 20`; on sinks set up before the timer existed, `git pull && bash setup.sh` installs it (and fixes the path right away) |
 | `./gen-certs.sh: Permission denied` | Your clone predates the scripts being marked executable in git. Run `bash gen-certs.sh` (or `git pull`) |
 | `test_prepared_statements.py` fails with `AttributeError: module 'ssl' has no attribute 'wrap_socket'` | You're using Ubuntu 24.04's apt `python3-mysql.connector` (8.0.15), which doesn't work on Python 3.12. Use the venv from Step 6 instead |
 | `mysql_probe`/`setup.sh` preflight fails with `ERROR 1045 Access denied` | Networking is fine (you got a real MySQL auth response, not a timeout) — this is a credentials issue. Check `DB_PASS` in `.env` matches the current `pmm_monitor` password exactly; if `.env` was ever edited on Windows, check for a stray trailing `\r` (`cat -A .env \| grep DB_PASS` — a `^M` before the line end means CRLF snuck in and is silently corrupting the password when bash sources it: fix with `sed -i 's/\r$//' .env`). Also confirm `pmm_monitor` actually exists on *this* DB cluster, not a previous one. |
@@ -658,6 +659,7 @@ applies, rather than you needing to guess from the symptom alone.
 | `verify-slow-log.sh` | Focused symlink verification (also called by `diagnose.sh`) — resolves `slow_query_log_file`, checks the symlink path, AND confirms the target file actually exists (a dangling symlink still "resolves" correctly, so both are checked). Supports `--direct` to bypass the socat proxy |
 | `destruct.sh` | Tears down everything `setup.sh` created (PMM node/service/agents, systemd units, rsyslog config, log dirs, symlink) so a re-run of `setup.sh` starts clean. See "Tearing down / starting over" above |
 | `test_prepared_statements.py` | Generates prepared-statement slow queries to validate the pipeline captures what `performance_schema` QAN cannot |
+| `reconcile-slowlog-symlink.sh` | Run every minute by `mysql-sink-reconcile.timer` (installed by `setup.sh`): one read-only `SELECT @@slow_query_log_file` through the socat proxy, and a new symlink if the path changed after a DB failover. Never touches anything at that path that isn't its own symlink |
 | `pmm_helper.py` | Stdlib-only helper behind `common.sh`'s PMM functions: exact service-name matching on `pmm-admin --json list`, and the PMM inventory lookups behind `setup.sh`'s node/service-ownership preflight |
 | `tests/` | Unit tests (`python3 -m unittest discover -s tests`) for `transform_logs.py` and `pmm_helper.py` — no network, no real paths |
 
@@ -671,6 +673,9 @@ applies, rather than you needing to guess from the symptom alone.
 | `/etc/rsyslog.d/99-mysql-sink.conf` | mTLS imtcp listener (port 6514) → routes input to the incoming log file |
 | `/etc/rsyslog.d/tls/` | CA + sink server cert/key used for the TLS syslog listener |
 | `/etc/mysql_sink/do-ca.crt` | DO Managed DB CA cert, used for `VERIFY_CA` on the credential probe |
+| `/etc/mysql_sink/reconcile.cnf` | Root-only (0600) MySQL client options (monitor user, via the socat proxy) for the reconcile timer |
+| `/etc/systemd/system/mysql-sink-reconcile.{service,timer}` | Re-points the slow-log symlink after DB failovers (every minute) |
+| `/var/lib/mysql_sink/symlinks.list` | Every slow-log symlink path this sink has created, so `destruct.sh` removes exactly those |
 | `/etc/systemd/system/slow-query-sink.service` | Systemd unit for the parser daemon |
 | `/etc/systemd/system/socat-mysql-proxy.service` | TCP proxy: `127.0.0.1:25060` → DO managed DB |
 | `/etc/logrotate.d/mysql-sink` | Rotation for both incoming (3-day) and processed (14-day) logs. The only thing that rotates these — PMM's own slow-log rotation is disabled by `setup.sh`, and `transform_logs.py` reopens its output after each rotation |

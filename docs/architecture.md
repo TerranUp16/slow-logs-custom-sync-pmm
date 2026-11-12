@@ -47,7 +47,13 @@ This is also why `setup.sh` re-resolves and re-creates the symlink on every
 run: if the DB reports a different path (new cluster, DB replacement), the
 symlink needs to move with it. On DO the reported path embeds the serving
 node's hostname (e.g. `/var/lib/mysql/8/data/<cluster>-1-slow.log`), so it is
-node-specific.
+node-specific — and it changes whenever the primary moves to another node: a
+failover, maintenance, or a resize (which replaces nodes; observed live, `-1`
+became `-4`). `mysql_slowlog_agent` re-reads the variable and opens the new
+path, so `mysql-sink-reconcile.timer` re-resolves it every minute and adds the
+symlink there (read-only towards the DB; it never replaces anything that isn't
+its own symlink). The agent picks the file up again by itself — QAN gap after
+a failover is about a minute, not "until someone re-runs setup.sh".
 
 ### Who rotates the log: logrotate, not PMM
 
