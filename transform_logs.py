@@ -51,14 +51,22 @@ SEQ_RE = re.compile(r'\[(\d+)-(\d+)\]')
 
 _running = True
 
-# Throttle drop warnings so a flood of bad input can't itself flood the journal.
+# Throttle drop warnings so a flood of bad input can't itself flood the journal:
+# at most one line per reason per DROP_LOG_INTERVAL, carrying the running count.
+# (Time-based rather than every-Nth, so a rare drop is never silent: logging
+# only the 1st and every 1000th hid the 2nd through 999th.)
+DROP_LOG_INTERVAL = 60.0
 _drop_counts = {}
+_drop_logged_at = {}
 
 
 def _warn_drop(reason):
     n = _drop_counts.get(reason, 0) + 1
     _drop_counts[reason] = n
-    if n == 1 or n % 1000 == 0:
+    now = time.monotonic()
+    last = _drop_logged_at.get(reason)
+    if last is None or now - last >= DROP_LOG_INTERVAL:
+        _drop_logged_at[reason] = now
         log.warning("Dropping input: %s (occurrences=%d)", reason, n)
 
 
@@ -78,9 +86,8 @@ def _open_tail(path):
     """Open path for tailing (seeked to end). Blocks until file exists."""
     while _running:
         try:
-            # errors="replace" surfaces malformed/garbage bytes as U+FFFD instead
-            # of silently dropping them, so tampering or corruption stays visible.
-            f = open(path, "r", errors="replace")
+            # Binary: _LineReader decodes each line only once it's complete.
+            f = open(path, "rb")
             inode = _get_inode(path)
             f.seek(0, 2)
             return f, inode
@@ -95,6 +102,53 @@ def _open_output(path):
     has moved the file out from under us — see _reopen_output_if_rotated."""
     f = open(path, "a")
     return f, os.fstat(f.fileno()).st_ino
+
+
+class _LineReader:
+    """Hand out only complete lines from a file rsyslog is still appending to.
+
+    readline() at end-of-file returns whatever is there, and the kernel copies a
+    write() into the file one 4 KiB page at a time, so for an instant the file
+    can end at a page boundary part-way through a line. A reader that polls at
+    that instant gets half a line now and the rest on its next read. Parsed as
+    two lines, neither half is valid: the line is lost (so its whole block is
+    dropped for a gap), truncated, or filed under host "unknown", depending on
+    where the cut falls. So a fragment is held back until its newline arrives.
+    (Seen live: a busy-polling reader on a sink caught ~3 such cuts a minute,
+    and the daemon, polling 10x/s, lost a slow query this way every few hours
+    on each test sink, each time at a line straddling a page boundary.)
+
+    Reads bytes and decodes each finished line itself, because a text-mode
+    reader would turn a multi-byte character split by such a cut into U+FFFD.
+    errors="replace" still surfaces genuinely malformed bytes as U+FFFD instead
+    of silently dropping them, so tampering or corruption stays visible.
+    """
+
+    def __init__(self, f):
+        self.f = f
+        self.pending = b""     # start of a line whose newline hasn't arrived yet
+        self.skipping = False  # inside an oversized line: discard up to its newline
+
+    def readline(self):
+        """The next complete line as str, or "" if none is complete yet."""
+        while True:
+            # Bounded read: an endless line can't grow memory past MAX_LINE_BYTES.
+            chunk = self.f.readline(MAX_LINE_BYTES + 1 - len(self.pending))
+            if not chunk:
+                return ""
+            if self.skipping:
+                self.skipping = not chunk.endswith(b"\n")
+                continue
+            line = self.pending + chunk
+            if not line.endswith(b"\n"):
+                if len(line) > MAX_LINE_BYTES:
+                    _warn_drop("oversized line")
+                    self.pending, self.skipping = b"", True
+                else:
+                    self.pending = line
+                continue
+            self.pending = b""
+            return line.decode("utf-8", errors="replace")
 
 
 def _reopen_output_if_rotated(path, out_file, out_inode):
@@ -215,11 +269,12 @@ def run():
     f, current_inode = _open_tail(COMBINED_FILE)
     if f is None:
         return
+    reader = _LineReader(f)
 
     out_file, out_inode = _open_output(SLOW_LOG_OUTPUT)
     try:
         while _running:
-            line = f.readline()
+            line = reader.readline()
 
             if line:
                 _process_line(line, blocks, block_times, active_block, out_file)
@@ -227,11 +282,17 @@ def run():
                 new_inode = _get_inode(COMBINED_FILE)
                 if new_inode is None or new_inode != current_inode:
                     log.info("File rotation detected, reopening %s", COMBINED_FILE)
+                    # A fragment left in the old file can't be finished by the
+                    # new one; gluing it to the new file's first line would
+                    # corrupt both.
+                    if reader.pending:
+                        _warn_drop("incomplete line at input rotation")
                     f.close()
                     f, current_inode = _open_tail(COMBINED_FILE)
                     if f is None:
                         break
                     f.seek(0)
+                    reader = _LineReader(f)
                     continue
 
                 out_file, out_inode = _reopen_output_if_rotated(SLOW_LOG_OUTPUT, out_file, out_inode)

@@ -56,9 +56,14 @@ def expected(*queries):
     return "".join("\n".join(q) + "\n\n" for q in queries)
 
 
+def reset_drop_counters():
+    tl._drop_counts.clear()
+    tl._drop_logged_at.clear()
+
+
 class ParserTests(unittest.TestCase):
     def setUp(self):
-        tl._drop_counts.clear()
+        reset_drop_counters()
         self.blocks, self.block_times, self.active = {}, {}, {}
         self.out = io.StringIO()
 
@@ -184,6 +189,69 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(len(self.blocks), 3)
         self.assertEqual(tl._drop_counts.get("max in-flight blocks reached"), 1)
 
+    def test_drop_warnings_throttled_by_time_not_count(self):
+        with self.assertLogs(tl.log, level="WARNING") as logs:
+            tl._warn_drop("finalized block has gaps")
+            tl._warn_drop("finalized block has gaps")   # within the interval: counted only
+            tl._drop_logged_at["finalized block has gaps"] -= tl.DROP_LOG_INTERVAL
+            tl._warn_drop("finalized block has gaps")   # interval elapsed: logged again
+        self.assertEqual(len(logs.records), 2)
+        self.assertIn("occurrences=3", logs.output[-1])
+
+
+class LineReaderTests(unittest.TestCase):
+    """_LineReader against a real file that's appended to between reads, the
+    way rsyslog appends to the incoming file while the daemon polls it."""
+
+    def setUp(self):
+        reset_drop_counters()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "in.log")
+        open(self.path, "wb").close()
+        self.f = open(self.path, "rb")
+        self.reader = tl._LineReader(self.f)
+
+    def tearDown(self):
+        self.f.close()
+        self.tmp.cleanup()
+
+    def append(self, data):
+        with open(self.path, "ab") as f:
+            f.write(data)
+
+    def test_fragment_held_until_its_newline_arrives(self):
+        self.append(b"first half, ")
+        self.assertEqual(self.reader.readline(), "")
+        self.append(b"second half\nnext\n")
+        self.assertEqual(self.reader.readline(), "first half, second half\n")
+        self.assertEqual(self.reader.readline(), "next\n")
+        self.assertEqual(self.reader.readline(), "")
+
+    def test_multibyte_character_split_across_reads(self):
+        data = "SELECT 'café';\n".encode("utf-8")
+        cut = data.index("é".encode("utf-8")) + 1   # between the two bytes of é
+        self.append(data[:cut])
+        self.assertEqual(self.reader.readline(), "")
+        self.append(data[cut:])
+        self.assertEqual(self.reader.readline(), "SELECT 'café';\n")
+
+    def test_malformed_bytes_still_surface_as_replacement_char(self):
+        self.append(b"bad \xff byte\n")
+        self.assertEqual(self.reader.readline(), "bad � byte\n")
+
+    def test_oversized_line_discarded_up_to_its_newline(self):
+        old = tl.MAX_LINE_BYTES
+        tl.MAX_LINE_BYTES = 64
+        try:
+            self.append(b"x" * 100)                  # no newline yet, already too long
+            self.assertEqual(self.reader.readline(), "")
+            self.assertEqual(self.reader.pending, b"", "must not buffer past the bound")
+            self.append(b"y" * 100 + b"\nok\n")
+            self.assertEqual(self.reader.readline(), "ok\n")
+        finally:
+            tl.MAX_LINE_BYTES = old
+        self.assertEqual(tl._drop_counts.get("oversized line"), 1)
+
 
 class DaemonLoopTests(unittest.TestCase):
     """Drive run() for real against temp files, to cover file-rotation handling."""
@@ -199,6 +267,7 @@ class DaemonLoopTests(unittest.TestCase):
         tl.COMBINED_FILE, tl.SLOW_LOG_OUTPUT = self.incoming, self.output
         tl.BLOCK_TTL = 0.5  # so stale-finalization happens within the test
         tl._running = True
+        reset_drop_counters()
         self.thread = threading.Thread(target=self._run_quietly, daemon=True)
         self.thread.start()
         self._wait_for(lambda: os.path.exists(self.output))
@@ -266,6 +335,47 @@ class DaemonLoopTests(unittest.TestCase):
         with open(self.incoming, "w") as f:
             f.writelines(block_lines("db-1", 2, QUERY_B))
         self._wait_for(lambda: self._read(self.output) == expected(QUERY_A, QUERY_B))
+
+    def _let_daemon_poll(self):
+        time.sleep(tl.POLL_INTERVAL * 4)
+
+    def test_line_cut_mid_write_is_reassembled(self):
+        # rsyslog's write() lands in the file a page at a time, so the daemon
+        # can read a line in two pieces. Cut line 2 at each kind of position
+        # that broke the old parser: before [SlowQuery] (rest filed under host
+        # "unknown"), between [SlowQuery] and the [block-line] tag (line lost,
+        # block dropped for a gap — what happened live), and in the payload
+        # (line truncated).
+        lines = [do_file_line("db-1", 1, i, p) for i, p in enumerate(REAL_QUERY, 1)]
+        target = lines[1]
+        cuts = {
+            "prefix": target.index("[SlowQuery]") - 5,
+            "tag-window": target.index("[MY-000000]"),
+            "payload": len(target) - 10,
+        }
+        for block_id, (name, cut) in enumerate(cuts.items(), 1):
+            with self.subTest(cut=name):
+                reset_drop_counters()
+                before = len(self._read(self.output))
+                lines = [do_file_line("db-1", block_id, i, p) for i, p in enumerate(REAL_QUERY, 1)]
+                self._append_input(lines[:1] + [lines[1][:cut]])
+                self._let_daemon_poll()
+                self._append_input([lines[1][cut:]] + lines[2:])
+                # BLOCK_TTL is 0.5 s here, so the block is flushed even though
+                # no next block follows it.
+                self._wait_for(lambda: self._read(self.output)[before:] == expected(REAL_QUERY))
+                time.sleep(tl.BLOCK_TTL * 2)   # let any stray "unknown" fragment block expire
+                self.assertEqual(tl._drop_counts, {})
+                self.assertEqual(self._read(self.output)[before:], expected(REAL_QUERY))
+
+    def test_fragment_left_at_input_rotation_is_dropped_not_glued(self):
+        self._append_input([syslog_line("db-1", 1, 1, "# Time: cut short")[:30]])
+        self._let_daemon_poll()
+        os.rename(self.incoming, self.incoming + ".1")
+        with open(self.incoming, "w") as f:
+            f.writelines(block_lines("db-1", 2, QUERY_B))
+        self._wait_for(lambda: self._read(self.output) == expected(QUERY_B))
+        self.assertEqual(tl._drop_counts.get("incomplete line at input rotation"), 1)
 
 
 if __name__ == "__main__":
