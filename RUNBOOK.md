@@ -63,20 +63,25 @@ curl -fsSL https://www.percona.com/get/pmm | bash
 
 This installs Docker and starts the PMM server container automatically. Wait ~60 seconds for it to finish initializing.
 
-**Getting an API token — two options:**
+**Getting an API token — two options.** Either way, use **one service account
+and token per sink Droplet**, so each sink can be revoked on its own without
+touching the others (see "Monitoring multiple Managed MySQL endpoints" below).
 
 - **Automatic (recommended for a fresh install):** leave `PMM_TOKEN` blank in
   `.env`. `setup.sh` checks whether `PMM_SERVER` is reachable; if it is and
   nobody has logged into the PMM UI yet (still on the default `admin`/`admin`
-  password), it mints an Admin-role API token itself via the PMM API and
-  writes it into `.env`. If `PMM_SERVER` isn't reachable yet, `setup.sh` prints
-  this install command and exits so you can run it, then re-run `setup.sh`.
+  password), it creates an Admin-role service account named
+  `sink-<PMM_NODE_NAME>` (reusing it if it already exists), mints a token for
+  it via the PMM API, and writes it into this sink's `.env`. If `PMM_SERVER`
+  isn't reachable yet, `setup.sh` prints this install command and exits so you
+  can run it, then re-run `setup.sh`.
 - **Manual:**
   1. Open `https://<PMM_SERVER_IP>` in a browser (accept the self-signed cert warning).
   2. Log in with `admin` / `admin`.
   3. You will be prompted to change the password — do so.
   4. Go to **Administration → Users and access → Service Accounts → Add
-     service account**. Name: anything (e.g. `sink-droplet`), Role: **Admin**.
+     service account**. Name: `sink-<node name>` (e.g. `sink-prod-primary`) —
+     one per sink. Role: **Admin**.
   5. Open the new service account → **Add service account token** → copy the
      token (starts with `glsa_`; you will not be able to view it again; strongly recommend storing in a secure password manager). Put
      it into `.env` as `PMM_TOKEN`.
@@ -131,7 +136,23 @@ PMM_TOKEN=<glsa_... token from Step 1, or leave blank to auto-mint on fresh inst
 # downloaded cert here yourself: paste it into certs/do-ca.crt instead (below) —
 # setup.sh copies it from there to this path automatically.
 # DO_CA_BUNDLE=/etc/mysql_sink/do-ca.crt
+
+# Optional — PMM identity and labels. With a single sink you can leave these
+# out (defaults: service "do-managed-mysql", node = this Droplet's hostname).
+# With more than one sink on the same PMM Server, PMM_SERVICE_NAME and the node
+# name MUST be unique per sink — see "Monitoring multiple Managed MySQL
+# endpoints with one PMM Server" below.
+# PMM_SERVICE_NAME=prod-primary
+# PMM_NODE_NAME=sink-prod-primary
+# PMM_ENVIRONMENT=production
+# PMM_CLUSTER=prod
+# PMM_REPLICATION_SET=prod
+# PMM_CUSTOM_LABELS=role=primary
 ```
+
+`env.example` lists every key with comments (including `LOCAL_PROXY_PORT` and
+`PMM_FORCE_REREGISTER`); `setup.sh` validates them before changing anything
+and stops with a clear message on an invalid value.
 
 > `SINK_HOSTNAME` is the linchpin of the TLS design: rsyslog presents a Let's Encrypt
 > cert issued for this name, and it is the destination you configure in DO log
@@ -290,16 +311,23 @@ bash setup.sh
 3. Deploys `transform_logs.py` and installs `socat`, a MySQL client, `rsyslog-openssl`, and `certbot`.
 4. Deploys the private CA cert, obtains (or reuses) a Let's Encrypt cert for `SINK_HOSTNAME`, and configures rsyslog for mutual-TLS syslog on port 6514 using the `ossl` driver.
 5. Installs `pmm-client`, creates the `socat` proxy service (so PMM connects to the DB via a local-looking address), and starts `slow-query-sink.service`.
-6. Registers the node with PMM Server.
-7. Queries the DB for its `slow_query_log_file` path and symlinks it to the processed log.
-8. Registers the MySQL service in PMM with `--query-source=slowlog`, and verifies it actually appears in `pmm-admin list`.
+6. Registers the node with PMM Server — after a read-only preflight (before
+   anything is changed) that a PMM node with this name isn't another
+   machine's and the service name isn't already used by another node. If this
+   Droplet is already registered and connected under that name, the node
+   registration is left as is.
+7. Queries the DB for its `slow_query_log_file` path and symlinks it to the processed log, and installs `mysql-sink-reconcile.timer`, which re-checks that path every minute and adds the symlink when it changes — DO's path embeds the serving node's hostname, so it changes on every primary failover (see Troubleshooting).
+8. Registers the MySQL service (`PMM_SERVICE_NAME`) in PMM with `--query-source=slowlog` and any labels set in `.env`, and verifies it actually appears in `pmm-admin list`.
 
 It's idempotent — safe to re-run after fixing a config issue, and after a
 `git pull` to pick up fixes: a re-run restarts `slow-query-sink` and the
-`socat` proxy so they run the new code/config. Each run also re-registers this
-Droplet's node with PMM (`pmm-admin config --force`), which removes and
-re-creates the MySQL service under the same name — QAN history stays
-available under the service name, but the PMM service/agent IDs change.
+`socat` proxy so they run the new code/config, keeps the existing PMM node
+(same node ID), and re-registers the MySQL service under the same name so it
+picks up the current `.env` (e.g. a new `DB_PASS` after a DB replacement, or
+changed labels). QAN history stays available under the service name; the
+service's PMM ID changes. To force a full node re-registration (e.g. after
+rotating `PMM_TOKEN` while the old token still works), run
+`PMM_FORCE_REREGISTER=1 bash setup.sh`.
 
 It also disables PMM's own built-in slow-log rotation for the service and
 leaves rotation to the sink's logrotate config. PMM's rotation renames
@@ -365,7 +393,7 @@ bash verify-slow-log.sh --direct     # bypass the proxy — isolates "is it the 
 > is broken.
 
 **In PMM UI:**
-- Navigate to **QAN** and select the `do-managed-mysql` service. See the note below on ingestion lag before assuming something's broken.
+- Navigate to **QAN** and select this sink's service — `PMM_SERVICE_NAME` from `.env`, `do-managed-mysql` if you didn't set one. See the note below on ingestion lag before assuming something's broken.
 
 **Generate test prepared statements** (optional, uses `test_prepared_statements.py` — this
 is what actually exercises the reason this whole pipeline exists: prepared
@@ -401,6 +429,112 @@ neither just prints its `Usage:` message and exits.)
 
 ---
 
+## Monitoring multiple Managed MySQL endpoints with one PMM Server
+
+Example: a Standard cluster `prod-primary` and its read-only replica
+`prod-replica`, both reporting to one PMM Server so they can be compared side
+by side. This is configuration only — no source edits on any sink.
+
+**One sink Droplet per endpoint, always.** An endpoint is a DO database
+resource with its own hostname and its own Log Forwarding destination: a
+cluster (its primary and any standby nodes forward together, to one sink), or
+a read-only replica. Each endpoint gets its own sink Droplet, running this
+repo with its own `.env`. All sinks point at the same `PMM_SERVER`. Standby
+nodes need nothing extra.
+
+Don't point two endpoints' Log Forwarding at the same sink. A sink has one
+ingest stream and one reconstructed log, so the second endpoint's slow queries
+would show up in QAN under the first endpoint's service.
+
+### What must be unique per sink
+
+PMM requires unique service names, and `pmm-admin config --force` replaces any
+node with the same name, so each sink needs:
+
+- **its own `PMM_SERVICE_NAME`** — what you'll pick in QAN (e.g. `prod-primary`,
+  `prod-replica`). Leaving two sinks on the default `do-managed-mysql` doesn't work:
+  the second `setup.sh` stops with "PMM service name … is already used by another node".
+- **its own node name** — distinct Droplet hostnames are enough, or set
+  `PMM_NODE_NAME` explicitly (e.g. `sink-prod-primary`). If two sinks end up with
+  the same node name, the second `setup.sh` stops instead of silently removing
+  the first one's registration ("… already exists and is NOT this machine's").
+- **its own PMM token** — one service account per sink (`sink-<node name>`;
+  auto-mint does this for you on a fresh PMM), so each sink can be revoked
+  without touching the others.
+- **its own mTLS CA and client cert** (`gen-certs.sh` on each sink), its own
+  `SINK_HOSTNAME`, and its own Let's Encrypt cert — exactly as for a single sink.
+
+### Worksheet
+
+| Value | `prod-primary` sink | `prod-replica` sink | Same or different? |
+|---|---|---|---|
+| `DB_HOST` | the cluster's host | the replica's host (Connection Details of the replica) | **different** |
+| `DB_PORT` | `25060` | `25060` | same |
+| `PMM_MONITOR_USER` / `DB_PASS` | `pmm_monitor` / its password | same user and password (users replicate — see below) | same |
+| `certs/do-ca.crt` | the cluster's CA | the replica's CA — identical to the cluster's in testing (one CA per DO project) | same |
+| `SINK_IP`, `SINK_HOSTNAME` | sink A's | sink B's | **different** |
+| `certs/` from `gen-certs.sh` | generated on sink A | generated on sink B | **different** |
+| `PMM_SERVER` | PMM Server | PMM Server | same |
+| `PMM_TOKEN` | token of `sink-prod-primary` | token of `sink-prod-replica` | **different** |
+| `PMM_SERVICE_NAME` | `prod-primary` | `prod-replica` | **different** |
+| `PMM_NODE_NAME` (or hostname) | `sink-prod-primary` | `sink-prod-replica` | **different** |
+| `PMM_ENVIRONMENT`, `PMM_CLUSTER`, `PMM_REPLICATION_SET` | e.g. `production`, `prod`, `prod` | same values | same (that's what groups them) |
+| `PMM_CUSTOM_LABELS` | `role=primary` | `role=replica` | **different** |
+| DO Log Forwarding destination | configured **on the cluster** → sink A's hostname | configured **on the replica** → sink B's hostname | **different** |
+| DO Trusted Sources | the cluster's list must include sink A | the replica's list must include sink B | **different** (per endpoint) |
+
+### Steps for each additional sink
+
+1. Provision the Droplet and do Steps 2–3 on it, with that endpoint's
+   `DB_HOST`, unique `PMM_SERVICE_NAME`/node name, and labels.
+2. Step 4 **on that endpoint**: check its Advanced Configuration, and add a Log
+   Forwarding destination on that endpoint pointing at **this** sink's
+   `SINK_HOSTNAME`, with **this** sink's `gen-certs.sh` client cert/key. Add this
+   sink to that endpoint's Trusted Sources.
+3. Step 5 (`bash setup.sh`) and Step 6 (`bash diagnose.sh`) on this sink.
+
+### Labels: grouping and comparing endpoints
+
+`PMM_ENVIRONMENT`, `PMM_CLUSTER`, `PMM_REPLICATION_SET` and `PMM_CUSTOM_LABELS`
+(`key=value,key=value`) are passed to `pmm-admin add mysql` only when set, and
+show up as filters in QAN and on the dashboards. Give endpoints that belong
+together the same cluster/replication set, and tell them apart with a custom
+label such as `role=primary` / `role=replica`. The same works for an
+old-versus-new comparison — e.g. label Standard-edition endpoints
+`edition=standard` and whatever else reports to the same PMM Server
+`edition=advanced`. (Advanced Edition clusters report to PMM directly via DO's
+managed PMM client and don't need a sink.) Changing a label in `.env` takes
+effect on the next `bash setup.sh`, which re-registers the service.
+
+### Read-only replica notes
+
+Verified on a DO Managed MySQL 8.4 Standard cluster with a read-only replica
+(November 2026):
+
+- **`pmm_monitor` is created on the primary and replicates.** The same user and
+  password work on the replica — don't create it there (the replica is
+  read-only: writes fail with `ERROR 1290 … --read-only`).
+- **A replica is its own endpoint in DO.** It has its own Trusted Sources,
+  Advanced Configuration and Log Forwarding. When the replica was created, its
+  Trusted Sources and Advanced Configuration (`slow_query_log`,
+  `long_query_time`, `log_output`) were **copied** from the primary, but **Log
+  Forwarding was not** — the replica starts with no destination, and gets its
+  own. They're copies, not links: a Trusted Source added to the primary later
+  did **not** appear on the replica (tested), so add each sink to the Trusted
+  Sources of the endpoint it monitors. Likewise check the replica's own
+  Advanced Configuration, and confirm on the replica DB itself that
+  `SELECT @@slow_query_log, @@log_output, @@long_query_time;` gives `1`,
+  `FILE`, `0.100000` (`diagnose.sh` on the replica's sink checks this).
+- **Same CA.** The replica's CA certificate was identical to the primary's
+  (DO issues one CA per project), so the same `certs/do-ca.crt` works.
+- **Each endpoint reports its own slow-log path** (it embeds the node's
+  hostname, e.g. `…/<cluster>-1-slow.log` vs `…/<replica>-1-slow.log`), so
+  sinks never collide on it.
+- **`test_prepared_statements.py` only runs `SELECT`s**, so it's safe to run
+  on the replica's sink.
+
+---
+
 ## Re-deploying after a DB replacement
 
 When the managed DB cluster is replaced (new hostname or password):
@@ -410,7 +544,7 @@ When the managed DB cluster is replaced (new hostname or password):
 3. On the sink Droplet, update `.env` with the new `DB_HOST` and `DB_PASS`.
 4. On the sink Droplet: `bash setup.sh`.
 
-The script is idempotent — it re-points and restarts the socat proxy at the new `DB_HOST`, recreates the symlink (the new cluster reports a different `slow_query_log_file` path), and re-registers this node and its MySQL service in PMM (`pmm-admin config --force`).
+The script is idempotent — it re-points and restarts the socat proxy at the new `DB_HOST`, recreates the symlink (the new cluster reports a different `slow_query_log_file` path), and re-registers the MySQL service in PMM with the new credentials (the node registration is kept).
 
 ---
 
@@ -438,7 +572,13 @@ needs updating, it isn't a no-op this time:
    before.
 5. Run `bash setup.sh` on the new Droplet (Step 5). It obtains a fresh Let's
    Encrypt cert for `SINK_HOSTNAME` (HTTP-01 needs port 80 reachable and the
-   A record pointing here).
+   A record pointing here). If the new Droplet ends up with the **same node
+   name** as the old one (same hostname, or the same `PMM_NODE_NAME`) and the
+   old node is still registered in PMM, `setup.sh` stops rather than replace a
+   node it can't prove is its own. Either remove the old one first
+   (`bash destruct.sh` on the old Droplet, or delete the node in PMM's
+   Inventory), or — once you're sure the old Droplet is gone — re-run with
+   `PMM_FORCE_REREGISTER=1 bash setup.sh`.
 6. Open ports 6514/tcp (syslog) and 80/tcp (ACME) inbound in the new
    droplet's firewall if one is configured.
 7. Decommission the old Droplet once QAN is confirmed flowing from the new
@@ -459,7 +599,7 @@ bash destruct.sh               # prompts for confirmation, then tears down
 bash destruct.sh --yes         # skip the confirmation prompt (automation)
 ```
 
-It removes, in order: the `do-managed-mysql` PMM service, this node's PMM
+It removes, in order: this sink's PMM service (`PMM_SERVICE_NAME`, default `do-managed-mysql`), this node's PMM
 registration (and every agent under it), the `slow-query-sink` and
 `socat-mysql-proxy` systemd units, the rsyslog mTLS listener config and its
 certs, the `slow_query_log_file` symlink (best-effort — needs the DB
@@ -498,6 +638,7 @@ applies, rather than you needing to guess from the symptom alone.
 | "Discarding stale incomplete block" in daemon logs | A multi-line slow query block arrived with missing lines — likely a transient rsyslog drop; normal at low frequency. (Older versions of `transform_logs.py` also logged this for the last, *complete* query before every quiet period — and dropped it — and logged every host as `host=unknown`. If you see `host=unknown`, you're on old code: `git pull && bash setup.sh`.) |
 | QAN worked for about a day, then stopped; `native_slow_query.log` is empty or tiny while `native_slow_query.log.1` keeps growing | Old `transform_logs.py`: it never reopened its output after logrotate's daily rotation, so it kept writing to the rotated file while PMM read the new, empty one. `diagnose.sh` stage 8 reports "daemon is writing to '…log.1'". Fix: `git pull && bash setup.sh` (it restarts the daemon on the new code) |
 | QAN stopped; the `slow_query_log_file` symlink is gone but `<that path>.old` exists; `journalctl -u pmm-agent` repeats `Failed to stat … no such file or directory` while `pmm-admin list` still shows `mysql_slowlog_agent Running` | PMM's own slow-log rotation fired (default limit 1 GiB): it renames the slow-log path to `.old` and expects `mysqld` to recreate it, which can't happen here. Fix: `git pull && bash setup.sh` — it recreates the symlink, removes the stale `.old`, and sets the service's PMM-side rotation limit to 0 (disabled). `diagnose.sh` and `verify-slow-log.sh` both detect this state |
+| QAN stopped right after a DB failover, maintenance or resize; `pmm-admin list` shows the slowlog agent `Waiting`; `verify-slow-log.sh` says the `slow_query_log_file` path doesn't exist | Expected for up to ~1 minute. DO's `slow_query_log_file` embeds the serving node's hostname (`…/<cluster>-<n>-slow.log`), and a failover — or a resize, which replaces nodes — moves the primary to a node with a different `<n>` (observed: `-1` → `-4`). `mysql-sink-reconcile.timer` notices within a minute and adds the symlink at the new path; the slowlog agent resumes by itself. If it doesn't: `systemctl status mysql-sink-reconcile.timer` and `journalctl -u mysql-sink-reconcile -n 20`; on sinks set up before the timer existed, `git pull && bash setup.sh` installs it (and fixes the path right away) |
 | `./gen-certs.sh: Permission denied` | Your clone predates the scripts being marked executable in git. Run `bash gen-certs.sh` (or `git pull`) |
 | `test_prepared_statements.py` fails with `AttributeError: module 'ssl' has no attribute 'wrap_socket'` | You're using Ubuntu 24.04's apt `python3-mysql.connector` (8.0.15), which doesn't work on Python 3.12. Use the venv from Step 6 instead |
 | `mysql_probe`/`setup.sh` preflight fails with `ERROR 1045 Access denied` | Networking is fine (you got a real MySQL auth response, not a timeout) — this is a credentials issue. Check `DB_PASS` in `.env` matches the current `pmm_monitor` password exactly; if `.env` was ever edited on Windows, check for a stray trailing `\r` (`cat -A .env \| grep DB_PASS` — a `^M` before the line end means CRLF snuck in and is silently corrupting the password when bash sources it: fix with `sed -i 's/\r$//' .env`). Also confirm `pmm_monitor` actually exists on *this* DB cluster, not a previous one. |
@@ -506,7 +647,8 @@ applies, rather than you needing to guess from the symptom alone.
 | `socat-mysql-proxy` fails to start | Check `DB_HOST` and `DB_PORT` in `/etc/systemd/system/socat-mysql-proxy.service`; test connectivity: `nc -zv <DB_HOST> 25060` |
 | `setup.sh`'s DB preflight/probe fails outright (no connection), or `verify-slow-log.sh` errors | Read the printed checklist (from `mysql_probe` in `common.sh`) — most common cause is the sink Droplet not being in the DB cluster's **Trusted Sources** (Databases → cluster → Settings → Trusted Sources); DO drops the connection with no error visible on this end. Also check the socat proxy (`systemctl status socat-mysql-proxy`), credentials in `.env`, and that the CA cert matches this exact cluster. `bash verify-slow-log.sh --direct` bypasses the proxy to isolate proxy vs. DB/firewall |
 | `mysql: command not found` (from `common.sh`'s `mysql_probe`, right at the start of `setup.sh`) | Expected to self-heal: `mysql_probe` auto-installs `default-mysql-client` via `apt-get` the first time it's needed, since a fresh Droplet doesn't ship a MySQL client and the preflight check runs before `setup.sh`'s own package-install step. If you still see this, either you're on an old copy of `common.sh` (`git pull` and re-run), you're not running as root (apt-get install needs root), or the Droplet has no working internet/apt access — install it yourself with `apt-get install -y default-mysql-client` and re-run |
-| `pmm-admin config` returns "node already exists" | `setup.sh` uses `--force` by default, so re-running the script handles this automatically. Note `--force` removes the existing node *with that name* along with all its services and agents — so two sink Droplets with the same hostname registered to one PMM Server will remove each other's registration |
+| `setup.sh` stops with "a PMM node named '…' already exists and is NOT this machine's" | Another machine (usually another sink with the same hostname) is registered under this node name. Registering would run `pmm-admin config --force`, which removes that node with all its services and agents — so `setup.sh` refuses. Set a unique `PMM_NODE_NAME` in `.env`; or, if that node is stale (its Droplet was deleted), re-run with `PMM_FORCE_REREGISTER=1` |
+| `setup.sh` stops with "PMM service name '…' is already used by another node" | PMM service names are unique per PMM Server and another sink already uses this one (often both are on the default `do-managed-mysql`). Set a unique `PMM_SERVICE_NAME` in `.env` — see "Monitoring multiple Managed MySQL endpoints with one PMM Server" |
 | Node + agents exist in PMM but no service | `setup.sh` registers the service last; if it exited earlier (e.g. the DB preflight/probe failed), the node/agents from `pmm-admin config` are left orphaned. Fix the earlier failure and re-run `setup.sh` — it's idempotent and will pick up from where it left off. To fully reset first, use `destruct.sh` above |
 | rsyslog silent failure (action suspended/resumed loop) | `/var/log/mysql_sink` and `/var/log/mysql_sink/incoming` must be owned `syslog:adm` (mode `750`, as `setup.sh` sets them) — root ownership breaks rsyslog writes. Re-run `setup.sh` to restore ownership |
 
@@ -523,6 +665,9 @@ applies, rather than you needing to guess from the symptom alone.
 | `verify-slow-log.sh` | Focused symlink verification (also called by `diagnose.sh`) — resolves `slow_query_log_file`, checks the symlink path, AND confirms the target file actually exists (a dangling symlink still "resolves" correctly, so both are checked). Supports `--direct` to bypass the socat proxy |
 | `destruct.sh` | Tears down everything `setup.sh` created (PMM node/service/agents, systemd units, rsyslog config, log dirs, symlink) so a re-run of `setup.sh` starts clean. See "Tearing down / starting over" above |
 | `test_prepared_statements.py` | Generates prepared-statement slow queries to validate the pipeline captures what `performance_schema` QAN cannot |
+| `reconcile-slowlog-symlink.sh` | Run every minute by `mysql-sink-reconcile.timer` (installed by `setup.sh`): one read-only `SELECT @@slow_query_log_file` through the socat proxy, and a new symlink if the path changed after a DB failover. Never touches anything at that path that isn't its own symlink |
+| `pmm_helper.py` | Stdlib-only helper behind `common.sh`'s PMM functions: exact service-name matching on `pmm-admin --json list`, and the PMM inventory lookups behind `setup.sh`'s node/service-ownership preflight |
+| `tests/` | Unit tests (`python3 -m unittest discover -s tests`) for `transform_logs.py` and `pmm_helper.py` — no network, no real paths |
 
 ## Key files on the sink Droplet
 
@@ -534,6 +679,9 @@ applies, rather than you needing to guess from the symptom alone.
 | `/etc/rsyslog.d/99-mysql-sink.conf` | mTLS imtcp listener (port 6514) → routes input to the incoming log file |
 | `/etc/rsyslog.d/tls/` | CA + sink server cert/key used for the TLS syslog listener |
 | `/etc/mysql_sink/do-ca.crt` | DO Managed DB CA cert, used for `VERIFY_CA` on the credential probe |
+| `/etc/mysql_sink/reconcile.cnf` | Root-only (0600) MySQL client options (monitor user, via the socat proxy) for the reconcile timer |
+| `/etc/systemd/system/mysql-sink-reconcile.{service,timer}` | Re-points the slow-log symlink after DB failovers (every minute) |
+| `/var/lib/mysql_sink/symlinks.list` | Every slow-log symlink path this sink has created, so `destruct.sh` removes exactly those |
 | `/etc/systemd/system/slow-query-sink.service` | Systemd unit for the parser daemon |
 | `/etc/systemd/system/socat-mysql-proxy.service` | TCP proxy: `127.0.0.1:25060` → DO managed DB |
 | `/etc/logrotate.d/mysql-sink` | Rotation for both incoming (3-day) and processed (14-day) logs. The only thing that rotates these — PMM's own slow-log rotation is disabled by `setup.sh`, and `transform_logs.py` reopens its output after each rotation |

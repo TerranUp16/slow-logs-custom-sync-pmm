@@ -6,7 +6,9 @@ Goal: verify that prepared statements (COM_STMT_PREPARE / COM_STMT_EXECUTE)
 are captured in the slow query log forwarded via syslog, since
 performance_schema does NOT log these.
 
-Connects via socat proxy on the sink droplet (127.0.0.1:25060).
+Connects via the socat proxy on the sink droplet (127.0.0.1:LOCAL_PROXY_PORT,
+default 25060) as PMM_MONITOR_USER (default pmm_monitor); TEST_DB_HOST
+overrides the host. Every statement is a SELECT, so it is safe on replicas.
 Requires the pmm_monitor DB password, either way:
   .venv/bin/python test_prepared_statements.py "$DB_PASS"
   DB_PASS=... .venv/bin/python test_prepared_statements.py
@@ -37,9 +39,12 @@ try:
 except ImportError:
     sys.exit("mysql-connector-python is required.\n" + VENV_HINT)
 
-HOST = "127.0.0.1"
-PORT = 25060
-USER = "pmm_monitor"
+# Defaults are the single-sink values; `set -a; source .env; set +a` exposes
+# LOCAL_PROXY_PORT / PMM_MONITOR_USER from .env, so the script follows them.
+# Only SELECTs (no writes), so it's safe to point at a read-only replica's sink.
+HOST = os.environ.get("TEST_DB_HOST", "127.0.0.1")
+PORT = int(os.environ.get("LOCAL_PROXY_PORT") or os.environ.get("DB_PORT") or 25060)
+USER = os.environ.get("PMM_MONITOR_USER") or "pmm_monitor"
 PASS = os.environ.get("DB_PASS", "")
 
 LONG_QUERY_TIME = 3.1  # just over the 3s threshold
