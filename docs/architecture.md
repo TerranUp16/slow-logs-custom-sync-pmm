@@ -91,12 +91,17 @@ this daemon.
 ## Deployment model: one sink Droplet per endpoint, no HA
 
 "Single sink" means **one sink per DB endpoint**. Each endpoint DO lets you
-point Log Forwarding at — a cluster's primary, or a read-only replica — gets
-its own sink Droplet, with its own `.env`, mTLS CA, PMM token, PMM node and
-PMM service. Any number of sinks can report to one PMM Server; they only need
-unique `PMM_SERVICE_NAME` and node names (`setup.sh` refuses to register over
-another machine's node or service). See RUNBOOK "Monitoring multiple Managed
-MySQL endpoints with one PMM Server".
+point Log Forwarding at — a cluster (primary and standby nodes forward
+together), or a read-only replica — gets its own sink Droplet, with its own
+`.env`, mTLS CA, PMM token, PMM node and PMM service. Any number of sinks can
+report to one PMM Server; they only need unique `PMM_SERVICE_NAME` and node
+names (`setup.sh` refuses to register over another machine's node or
+service). See RUNBOOK "Monitoring multiple Managed MySQL endpoints with one
+PMM Server".
+
+Serving several endpoints from one sink was designed and deliberately not
+pursued. One sink per endpoint is the model; don't add multi-endpoint support
+to a sink.
 
 Each sink is intentionally a single, non-clustered resource — no
 horizontal scaling, no standby, no automatic failover. If it goes down, log

@@ -435,10 +435,16 @@ Example: a Standard cluster `prod-primary` and its read-only replica
 `prod-replica`, both reporting to one PMM Server so they can be compared side
 by side. This is configuration only — no source edits on any sink.
 
-**Shape: one sink Droplet per endpoint.** Each endpoint that has its own Log
-Forwarding destination (a cluster's primary, and each read-only replica) gets
-its own sink Droplet, running this repo with its own `.env`. All sinks point
-at the same `PMM_SERVER`.
+**One sink Droplet per endpoint, always.** An endpoint is a DO database
+resource with its own hostname and its own Log Forwarding destination: a
+cluster (its primary and any standby nodes forward together, to one sink), or
+a read-only replica. Each endpoint gets its own sink Droplet, running this
+repo with its own `.env`. All sinks point at the same `PMM_SERVER`. Standby
+nodes need nothing extra.
+
+Don't point two endpoints' Log Forwarding at the same sink. A sink has one
+ingest stream and one reconstructed log, so the second endpoint's slow queries
+would show up in QAN under the first endpoint's service.
 
 ### What must be unique per sink
 
