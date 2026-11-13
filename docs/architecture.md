@@ -79,7 +79,10 @@ lines), their syslog lines can interleave, and a naive line-by-line parser
 would corrupt entries by mixing lines from different queries or different
 nodes. `source_host` is parsed from rsyslog's file output, whose format
 `setup.sh` pins (`RSYSLOG_FileFormat`) so it doesn't depend on distro
-defaults.
+defaults. The daemon only parses complete lines: it can catch rsyslog
+part-way through writing one (the kernel copies a write into the file a page
+at a time), so a fragment waits for its newline instead of being parsed as
+two broken lines.
 
 A block is written to the processed log once it's known to be finished: when
 the same host starts its next block, or — for the last block before a quiet
