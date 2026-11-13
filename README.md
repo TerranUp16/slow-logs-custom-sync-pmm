@@ -21,7 +21,7 @@ Full design rationale and pipeline diagram: [docs/architecture.md](docs/architec
 ## Prerequisites
 
 - Two Ubuntu Droplets: one running PMM Server, one to act as the sink
-  (**Ubuntu 24.04 LTS recommended**; 22.04 LTS also supported — see
+  (**Ubuntu 24.04 LTS recommended**; 22.04 and 26.04 LTS also supported — see
   [Supported OS versions](RUNBOOK.md#supported-os-versions)).
 - A public DNS A record pointing at the sink Droplet (or an
   [sslip.io](https://sslip.io) address for testing — see
@@ -51,9 +51,15 @@ Full design rationale and pipeline diagram: [docs/architecture.md](docs/architec
    ./gen-certs.sh
    ```
 5. **Configure DO Managed MySQL**: enable slow query log, set
-   `log_output=INSIGHTS`, and set up mutual-TLS log forwarding to the sink
-   (pasting the cert/key `gen-certs.sh` just produced into DO's panel).
+   `log_output=LOGS` (formerly called `INSIGHTS`) and `long_query_time=0.1`,
+   and set up mutual-TLS log forwarding to the sink (pasting the cert/key
+   `gen-certs.sh` just produced into DO's panel).
    Full steps: [RUNBOOK.md, Step 4](RUNBOOK.md#step-4--configure-do-managed-db).
+
+   `0.1` is the lowest `long_query_time` DO accepts, so **QAN only shows
+   statements that take ≥ 100 ms** — prepared or not. Faster queries never
+   reach the slow log. See the RUNBOOK's Step 4 note on what that means for
+   reading QAN.
 6. **Run setup**, still in the same SSH session:
    ```bash
    bash setup.sh
@@ -113,10 +119,16 @@ and reports exactly where it's stuck if something isn't working.
 ## Validate prepared statements are captured
 
 ```bash
-pip3 install mysql-connector-python --break-system-packages
+apt-get install -y python3-venv
+python3 -m venv .venv && .venv/bin/pip install mysql-connector-python
 set -a; source .env; set +a
-python3 test_prepared_statements.py "$DB_PASS"
+.venv/bin/python test_prepared_statements.py "$DB_PASS"
 ```
+
+(Use the venv rather than Ubuntu's `python3-mysql.connector` package — on
+24.04 that's connector 8.0.15, which fails on Python 3.12 with
+`module 'ssl' has no attribute 'wrap_socket'`. Details:
+[RUNBOOK.md, Step 6](RUNBOOK.md#step-6--verify).)
 
 Runs several `SLEEP()`-padded prepared statements against the DB and prints
 where to check for them (`native_slow_query.log`, then PMM's QAN UI — give

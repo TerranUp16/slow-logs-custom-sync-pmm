@@ -64,6 +64,14 @@ echo ""
 echo "==> Checking the symlink"
 if ! ls -la "$SLOW_LOG_PATH" 2>/dev/null; then
   echo "ERROR: $SLOW_LOG_PATH does not exist on this filesystem." >&2
+  if [ -L "${SLOW_LOG_PATH}.old" ]; then
+    echo "  ${SLOW_LOG_PATH}.old exists — PMM's own slow-log rotation renamed the symlink" >&2
+    echo "  away (it expects mysqld to recreate the file, which can't happen here)." >&2
+    echo "  Fix: git pull && bash setup.sh — recreates the symlink and disables PMM-side rotation." >&2
+  else
+    echo "  Re-run setup.sh to create it (or, if the DB just failed over / was replaced," >&2
+    echo "  the reported path may have changed — setup.sh re-resolves it)." >&2
+  fi
   exit 1
 fi
 

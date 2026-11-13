@@ -8,23 +8,34 @@ performance_schema does NOT log these.
 
 Connects via socat proxy on the sink droplet (127.0.0.1:25060).
 Requires the pmm_monitor DB password, either way:
-  python3 test_prepared_statements.py "$DB_PASS"
-  DB_PASS=... python3 test_prepared_statements.py
+  .venv/bin/python test_prepared_statements.py "$DB_PASS"
+  DB_PASS=... .venv/bin/python test_prepared_statements.py
+
+Needs a current mysql-connector-python from PyPI, in a venv (see RUNBOOK Step 6):
+  apt-get install -y python3-venv
+  python3 -m venv .venv && .venv/bin/pip install mysql-connector-python
+Don't use Ubuntu 24.04's apt package python3-mysql.connector: it is 8.0.15,
+which calls ssl.wrap_socket() — removed in the Python 3.12 that 24.04 ships —
+and fails on connect. (26.04's apt package, 9.5.0, works; the venv works on all.)
 """
 
 import os
 import sys
 import time
 
+VENV_HINT = (
+    "Install a current mysql-connector-python into a venv and run this script with it:\n"
+    "  apt-get install -y python3-venv\n"
+    "  python3 -m venv .venv && .venv/bin/pip install mysql-connector-python\n"
+    "  .venv/bin/python test_prepared_statements.py \"$DB_PASS\"\n"
+    "(See RUNBOOK Step 6. Ubuntu 24.04's apt package python3-mysql.connector, 8.0.15,\n"
+    "is too old for the Python 3.12 it ships with — don't use it there.)"
+)
+
 try:
     import mysql.connector
 except ImportError:
-    sys.exit(
-        "mysql-connector-python is required. Install it, then re-run this script:\n"
-        "  pip3 install mysql-connector-python --break-system-packages\n"
-        "(or, if you'd rather not touch system packages: python3 -m venv .venv "
-        "&& . .venv/bin/activate && pip install mysql-connector-python)"
-    )
+    sys.exit("mysql-connector-python is required.\n" + VENV_HINT)
 
 HOST = "127.0.0.1"
 PORT = 25060
@@ -75,15 +86,26 @@ TESTS = [
 
 
 def run_tests(password: str) -> None:
-    print(f"Connecting to {HOST}:{PORT} as {USER}...")
-    conn = mysql.connector.connect(
-        host=HOST,
-        port=PORT,
-        user=USER,
-        password=password,
-        ssl_disabled=False,
-        use_pure=True,
-    )
+    print(f"Connecting to {HOST}:{PORT} as {USER} (mysql-connector-python {mysql.connector.__version__})...")
+    try:
+        conn = mysql.connector.connect(
+            host=HOST,
+            port=PORT,
+            user=USER,
+            password=password,
+            ssl_disabled=False,
+            use_pure=True,
+        )
+    except AttributeError as e:
+        # The telltale failure of Ubuntu's apt python3-mysql.connector (8.0.x)
+        # on Python 3.12+, where ssl.wrap_socket() no longer exists.
+        if "wrap_socket" not in str(e):
+            raise
+        sys.exit(
+            f"This mysql-connector-python ({mysql.connector.__version__}, from "
+            f"{os.path.dirname(mysql.connector.__file__)}) is too old for Python "
+            f"{sys.version_info.major}.{sys.version_info.minor}: {e}\n" + VENV_HINT
+        )
     cursor = conn.cursor(prepared=True)  # forces COM_STMT_PREPARE protocol
     print(f"Connected. Running {len(TESTS)} prepared statement tests (each >{LONG_QUERY_TIME}s).\n")
 

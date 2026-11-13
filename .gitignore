@@ -4,3 +4,8 @@ certs/
 # Cowork/Claude Code local session state — machine-local, not part of the
 # deployable integration, and not something to ship in this repo.
 .claude/
+
+# Local virtualenv for test_prepared_statements.py (RUNBOOK Step 6), and
+# bytecode from running tests/.
+.venv/
+__pycache__/

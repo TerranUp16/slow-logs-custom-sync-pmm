@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Deploys and configures the MySQL slow log sink + PMM 3 integration on sink-experiment droplet.
+# Deploys and configures the MySQL slow log sink + PMM 3 integration on the sink Droplet.
 # Run as root on the droplet.  Reads credentials from .env in the same directory.
 set -euo pipefail
 
@@ -17,6 +17,9 @@ source "$SCRIPT_DIR_LOCAL/common.sh"
 
 # Load .env if present
 if [ -f "$SCRIPT_DIR_LOCAL/.env" ]; then
+  # .env holds DB_PASS and PMM_TOKEN — keep it owner-only regardless of how it
+  # was created (an editor or `cat >` leaves it at the umask default, 0644).
+  chmod 600 "$SCRIPT_DIR_LOCAL/.env"
   set -a
   # shellcheck disable=SC1091
   source "$SCRIPT_DIR_LOCAL/.env"
@@ -52,23 +55,22 @@ INCOMING_DIR="/var/log/mysql_sink/incoming"
 PROCESSED_DIR="/var/log/mysql_sink/processed"
 
 echo "==> Checking OS compatibility"
-# Only Ubuntu 22.04 LTS and 24.04 LTS are supported. Percona has not released
-# (or tested) percona-release/pmm-client packages for other versions,
-# including 26.04 LTS — getting pmm-client installed there requires manually
-# rewriting apt package-source distro codenames to point at an older
-# release's repo. That may happen to work, but it's unverified by Percona
-# and can break silently on any Percona-side update. This is a warning, not
-# a hard stop, so existing unsupported test boxes aren't locked out — but
-# don't deploy a real integration this way.
+# Supported: Ubuntu 22.04, 24.04 and 26.04 LTS — the releases Percona's
+# pmm3-client apt repo publishes pmm-client for (jammy/noble/resolute), and that
+# this pipeline has been validated on. Anything else needs pmm-client installed
+# some unsupported way (e.g. pointing apt at another release's repo), which can
+# break silently on any Percona-side update. This is a warning, not a hard
+# stop, so existing test boxes aren't locked out — but don't deploy a real
+# integration this way.
 if [ -f /etc/os-release ]; then
   # shellcheck disable=SC1091
   . /etc/os-release
   case "${VERSION_ID:-}" in
-    22.04|24.04) : ;;
+    22.04|24.04|26.04) : ;;
     *)
       echo "" >&2
-      echo "WARNING: this is Ubuntu ${VERSION_ID:-<unknown>}, not 22.04 LTS or 24.04 LTS." >&2
-      echo "Percona does not support/test pmm-client packages on this version. See the" >&2
+      echo "WARNING: this is Ubuntu ${VERSION_ID:-<unknown>}, not 22.04, 24.04 or 26.04 LTS." >&2
+      echo "Percona does not publish pmm-client packages for this version. See the" >&2
       echo "RUNBOOK 'Supported OS versions' note. Continuing in 5s — Ctrl+C to abort." >&2
       sleep 5
       ;;
@@ -139,11 +141,19 @@ INSTR
   [ -n "$PMM_TOKEN" ] || PMM_MINT_FAIL
 
   echo "==> Minted PMM API token — writing PMM_TOKEN into .env"
-  if grep -q '^PMM_TOKEN=' "$SCRIPT_DIR_LOCAL/.env" 2>/dev/null; then
-    sed -i.bak "s|^PMM_TOKEN=.*|PMM_TOKEN=${PMM_TOKEN}|" "$SCRIPT_DIR_LOCAL/.env" && rm -f "$SCRIPT_DIR_LOCAL/.env.bak"
-  else
-    printf 'PMM_TOKEN=%s\n' "$PMM_TOKEN" >> "$SCRIPT_DIR_LOCAL/.env"
-  fi
+  # awk reads the token from its environment, not its argv (a sed expression
+  # would put the token in `ps` output), and the rewrite goes through a 0600
+  # mktemp file so .env is never briefly world-readable or half-written.
+  ENV_FILE="$SCRIPT_DIR_LOCAL/.env"
+  touch "$ENV_FILE" && chmod 600 "$ENV_FILE"
+  ENV_TMP="$(mktemp "${ENV_FILE}.XXXXXX")"
+  PMM_TOKEN="$PMM_TOKEN" awk '
+    BEGIN { t = ENVIRON["PMM_TOKEN"] }
+    /^PMM_TOKEN=/ { print "PMM_TOKEN=" t; done = 1; next }
+    { print }
+    END { if (!done) print "PMM_TOKEN=" t }
+  ' "$ENV_FILE" > "$ENV_TMP"
+  mv "$ENV_TMP" "$ENV_FILE"
   echo "  NOTE: only the .env copy on this host was updated — copy PMM_TOKEN back"
   echo "  into your local repo's .env if you want it to persist for future runs."
 fi
@@ -161,7 +171,12 @@ echo "==> Setting ownership (syslog writes incoming; daemon writes processed; pm
 chown syslog:adm   /var/log/mysql_sink "$INCOMING_DIR"
 chown mysqlsink:adm "$PROCESSED_DIR"
 chown root:root    "$SCRIPT_DIR"
-chmod 750 /var/log/mysql_sink "$INCOMING_DIR" "$PROCESSED_DIR"
+chmod 750 /var/log/mysql_sink "$INCOMING_DIR"
+# setgid on processed/ so a native_slow_query.log the daemon (re)creates itself
+# — e.g. after a rotation, see transform_logs.py — inherits group adm, matching
+# what logrotate's `create 0640 mysqlsink adm` produces. The daemon's
+# UMask=0027 (slow-query-sink.service) supplies the 0640.
+chmod 2750 "$PROCESSED_DIR"
 chmod 755 "$SCRIPT_DIR"
 
 echo "==> Deploying transform_logs.py"
@@ -270,9 +285,17 @@ module(load="imtcp"
 
 input(type="imtcp" port="6514")
 
-# Route TLS-received syslog input to the MySQL sink file
-if $inputname == 'imtcp' then /var/log/mysql_sink/incoming/combined_mysql.log
-& stop
+# Route TLS-received syslog input to the MySQL sink file.
+# The file template is pinned (rather than inheriting the distro's omfile
+# default) because transform_logs.py parses each line's source host out of it;
+# owner/group/mode match Ubuntu's rsyslog.conf defaults ($FileOwner etc.) so
+# pmm-agent and the daemon keep reading it via group adm.
+if $inputname == 'imtcp' then {
+  action(type="omfile" file="/var/log/mysql_sink/incoming/combined_mysql.log"
+         template="RSYSLOG_FileFormat"
+         fileOwner="syslog" fileGroup="adm" fileCreateMode="0640")
+  stop
+}
 EOF
 systemctl restart rsyslog
 
@@ -324,7 +347,11 @@ RestrictAddressFamilies=AF_INET AF_INET6
 WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
-systemctl enable --now socat-mysql-proxy.service
+# restart, not just `enable --now`: on a re-run (e.g. new DB_HOST after a DB
+# replacement) the proxy is already running and `--now` would leave it pointed
+# at the old target.
+systemctl enable socat-mysql-proxy.service
+systemctl restart socat-mysql-proxy.service
 
 echo "==> Removing legacy cron job (replaced by systemd service)"
 ( crontab -l 2>/dev/null | grep -v transform_logs ) | crontab - || true
@@ -332,7 +359,11 @@ echo "==> Removing legacy cron job (replaced by systemd service)"
 echo "==> Installing slow-query-sink systemd service"
 cp "$(dirname "$0")/slow-query-sink.service" /etc/systemd/system/slow-query-sink.service
 systemctl daemon-reload
-systemctl enable --now slow-query-sink.service
+# restart, not just `enable --now`: after `git pull && bash setup.sh` the daemon
+# is already running the OLD transform_logs.py, and `--now` wouldn't pick up
+# the new code or unit until the next reboot.
+systemctl enable slow-query-sink.service
+systemctl restart slow-query-sink.service
 
 echo "==> Installing logrotate config"
 cat > /etc/logrotate.d/mysql-sink <<EOF
@@ -372,9 +403,14 @@ pmm-admin config \
   --server-insecure-tls \
   --server-url="https://service_token:${PMM_TOKEN}@${PMM_SERVER}:443"
 
-# Allow pmm-agent to read the processed log (group adm, mode 640)
+# Allow pmm-agent to read the processed log (group adm, mode 640). The file may
+# not exist yet (the daemon creates it on first data); if it does, normalize it
+# to what a freshly created/rotated one gets.
 usermod -aG adm pmm-agent
-chmod 640 "$PROCESSED_DIR/native_slow_query.log" 2>/dev/null || true
+if [ -f "$PROCESSED_DIR/native_slow_query.log" ]; then
+  chown mysqlsink:adm "$PROCESSED_DIR/native_slow_query.log"
+  chmod 640 "$PROCESSED_DIR/native_slow_query.log"
+fi
 systemctl restart pmm-agent
 sleep 3  # give agent time to connect before adding service
 
@@ -400,6 +436,13 @@ mkdir -p "$SLOW_LOG_DIR"
 chmod 755 "$SLOW_LOG_DIR"
 ln -sf "$PROCESSED_DIR/native_slow_query.log" "$SLOW_LOG_PATH"
 echo "  Symlink: $SLOW_LOG_PATH -> $PROCESSED_DIR/native_slow_query.log"
+# Leftover from PMM's own slow-log rotation (disabled below): it renames
+# slow_query_log_file to <path>.old — i.e. renames our symlink away. Remove it
+# only if it's ours.
+if [ -L "${SLOW_LOG_PATH}.old" ] && [ "$(readlink -f "${SLOW_LOG_PATH}.old")" = "$PROCESSED_DIR/native_slow_query.log" ]; then
+  rm -f "${SLOW_LOG_PATH}.old"
+  echo "  Removed stale ${SLOW_LOG_PATH}.old (left by a PMM-side rotation)"
+fi
 
 echo "==> Registering MySQL service in PMM"
 if pmm-admin list 2>/dev/null | grep -q 'do-managed-mysql'; then
@@ -410,6 +453,10 @@ else
   #  - --tls-skip-verify stays: the agent connects to 127.0.0.1 (socat) while the
   #    DB cert is issued for the DO hostname, so strict verification can't match.
   #    The DB hop is still TLS-encrypted end-to-end through the socat passthrough.
+  # PMM's own slow-log rotation is disabled in the next step rather than with
+  # --size-slow-logs here: pmm-admin 3.10 rejects the documented "-1" ("unknown
+  # unit") and only takes "-1B", and the next step has to exist anyway to fix
+  # services registered by older versions of this script.
   pmm-admin add mysql \
     --username="$PMM_MONITOR_USER" \
     --password="$DB_PASS" \
@@ -428,6 +475,26 @@ if ! pmm-admin list 2>/dev/null | grep -q 'do-managed-mysql'; then
   echo "Check: pmm-admin status ; journalctl -u pmm-agent -n 50" >&2
   exit 1
 fi
+
+echo "==> Disabling PMM's built-in slow-log rotation (logrotate owns rotation here)"
+# PMM's slowlog agent rotates by renaming slow_query_log_file to <path>.old and
+# running FLUSH SLOW LOGS on the DB, expecting mysqld to recreate the file. Here
+# that path is our symlink and mysqld is remote, so the symlink is renamed away,
+# nothing recreates it, and QAN goes silent (pmm-agent logs "Failed to stat" in
+# a loop while `pmm-admin list` still says Running). It triggers once the
+# processed log passes the limit (PMM default 1 GiB) and the monitor user has
+# RELOAD, which DO's default users do.
+# Applies to a service registered just now and, in place, to one registered by
+# an older version of this script (which got PMM's 1 GiB default). Idempotent:
+# PMM stores 0 as "no limit" and the agent skips rotation for sizes <= 0.
+SLOWLOG_AGENT_ID="$(pmm_slowlog_agent_id do-managed-mysql)"
+if [ -z "$SLOWLOG_AGENT_ID" ]; then
+  echo "ERROR: no QAN slowlog agent found for service 'do-managed-mysql' in 'pmm-admin --json list'." >&2
+  echo "Check: pmm-admin list ; journalctl -u pmm-agent -n 50" >&2
+  exit 1
+fi
+pmm-admin inventory change agent qan-mysql-slowlog-agent "$SLOWLOG_AGENT_ID" --max-slowlog-file-size=0 >/dev/null
+echo "  slowlog agent $SLOWLOG_AGENT_ID: max slowlog file size = 0 (no PMM-side rotation)"
 
 echo ""
 echo "==> Done. Run 'pmm-admin list' to verify agents are Running."
